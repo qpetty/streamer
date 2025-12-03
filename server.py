@@ -1193,9 +1193,11 @@ def run_file_inference(
     image_dir: str,
     output_dir: str = "stream-output",
     verbose: bool = True,
+    num_iterations: int = 1,
+    warmup_iterations: int = 1,
 ) -> bytes:
     """
-    Run a single inference on images from a directory.
+    Run inference on images from a directory with optional multiple iterations for benchmarking.
     
     This is a simplified function for testing with file-based images
     without starting the full GStreamer server.
@@ -1204,9 +1206,11 @@ def run_file_inference(
         image_dir: Directory containing at least 2 images
         output_dir: Directory to save output PLY file
         verbose: Print progress
+        num_iterations: Number of inference iterations to run for benchmarking (default: 1)
+        warmup_iterations: Number of warmup iterations before timing (default: 1)
         
     Returns:
-        PLY file contents as bytes
+        PLY file contents as bytes (from the last iteration)
     """
     from PIL import Image
     
@@ -1256,83 +1260,102 @@ def run_file_inference(
     # Get original dimensions
     orig_height, orig_width = frame_0.shape[:2]
     
-    if verbose:
-        print(f"\n" + "="*50)
-        print(f"Running DepthAnything3 inference...")
-        print(f"="*50)
-    
-    # Run DepthAnything3
-    da3_start = time.time()
-    prediction = depth_anything.inference(
-        image=[frame_0, frame_1],
-        process_res=504,
-        process_res_method="upper_bound_resize",
-    )
-    da3_elapsed = time.time() - da3_start
-    
-    # Get processed size
-    processed_height, processed_width = prediction.processed_images.shape[1:3]
-    
-    if verbose:
-        print(f"  Processed images size: {processed_width}x{processed_height}")
-        print(f"  Original images size: {orig_width}x{orig_height}")
-        print(f"  >>> DepthAnything3 inference time: {da3_elapsed:.3f}s <<<")
-    
-    # Convert W2C to C2W
-    w2c = prediction.extrinsics
-    c2w = w2c_to_c2w(w2c)
-    
-    if verbose:
-        print(f"  Converted W2C extrinsics to C2W poses")
-        print(f"  W2C shape: {w2c.shape}, C2W shape: {c2w.shape}")
-    
-    # Scale intrinsics
-    da3_intrinsics = prediction.intrinsics
-    scaled_intrinsics = scale_intrinsics(
-        da3_intrinsics,
-        from_width=processed_width,
-        from_height=processed_height,
-        to_width=orig_width,
-        to_height=orig_height,
-    )
-    
-    if verbose:
-        print(f"  Scaled intrinsics from {processed_width}x{processed_height} to {orig_width}x{orig_height}")
-    
-    # Convert frames to tensors
+    # Pre-convert frames to tensors (done once, reused for all iterations)
     frame_0_tensor = torch.from_numpy(frame_0).permute(2, 0, 1).float() / 255.0
     frame_1_tensor = torch.from_numpy(frame_1).permute(2, 0, 1).float() / 255.0
     images = torch.stack([frame_0_tensor, frame_1_tensor], dim=0)
     
-    if verbose:
-        print(f"\n" + "="*50)
-        print(f"Running DepthSplat encoder...")
-        print(f"="*50)
-    
-    # Run encoder
-    encoder_start = time.time()
+    # Inference configuration
     inference_config = InferenceConfig(
         target_height=512,
         target_width=960,
         near_disparity=1.0,
         far_disparity=0.1,
-        verbose=verbose,
+        verbose=False,  # Suppress per-iteration verbose output
     )
     
-    ply_bytes = encoder.run_from_data(
-        images=images,
-        intrinsics_list=[scaled_intrinsics[0], scaled_intrinsics[1]],
-        extrinsics_list=[c2w[0], c2w[1]],
-        original_sizes=[(orig_width, orig_height), (orig_width, orig_height)],
-        image_filenames=[Path(path_0).name, Path(path_1).name],
-        config=inference_config,
-    )
-    encoder_elapsed = time.time() - encoder_start
+    # Storage for timing statistics
+    da3_times = []
+    encoder_times = []
+    total_inference_times = []
+    
+    total_iterations = warmup_iterations + num_iterations
     
     if verbose:
-        print(f"  >>> DepthSplat encoder time: {encoder_elapsed:.3f}s <<<")
+        print(f"\n" + "="*70)
+        print(f"BENCHMARK: {warmup_iterations} warmup + {num_iterations} timed iterations")
+        print(f"="*70)
     
-    # Save output
+    ply_bytes = None
+    
+    for iteration in range(total_iterations):
+        is_warmup = iteration < warmup_iterations
+        iter_label = f"Warmup {iteration + 1}/{warmup_iterations}" if is_warmup else f"Iteration {iteration - warmup_iterations + 1}/{num_iterations}"
+        
+        if verbose:
+            print(f"\n[{iter_label}]")
+        
+        iter_start = time.time()
+        
+        # Run DepthAnything3
+        da3_start = time.time()
+        prediction = depth_anything.inference(
+            image=[frame_0, frame_1],
+            process_res=504,
+            process_res_method="upper_bound_resize",
+        )
+        
+        # Ensure CUDA synchronization for accurate timing
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        da3_elapsed = time.time() - da3_start
+        
+        # Get processed size (only need to do this once)
+        processed_height, processed_width = prediction.processed_images.shape[1:3]
+        
+        # Convert W2C to C2W
+        w2c = prediction.extrinsics
+        c2w = w2c_to_c2w(w2c)
+        
+        # Scale intrinsics
+        da3_intrinsics = prediction.intrinsics
+        scaled_intrinsics = scale_intrinsics(
+            da3_intrinsics,
+            from_width=processed_width,
+            from_height=processed_height,
+            to_width=orig_width,
+            to_height=orig_height,
+        )
+        
+        # Run encoder
+        encoder_start = time.time()
+        ply_bytes = encoder.run_from_data(
+            images=images,
+            intrinsics_list=[scaled_intrinsics[0], scaled_intrinsics[1]],
+            extrinsics_list=[c2w[0], c2w[1]],
+            original_sizes=[(orig_width, orig_height), (orig_width, orig_height)],
+            image_filenames=[Path(path_0).name, Path(path_1).name],
+            config=inference_config,
+        )
+        
+        # Ensure CUDA synchronization for accurate timing
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        encoder_elapsed = time.time() - encoder_start
+        
+        iter_elapsed = time.time() - iter_start
+        
+        if verbose:
+            status = "(warmup - not counted)" if is_warmup else ""
+            print(f"  DepthAnything3: {da3_elapsed:.3f}s | Encoder: {encoder_elapsed:.3f}s | Total: {iter_elapsed:.3f}s {status}")
+        
+        # Only record times for non-warmup iterations
+        if not is_warmup:
+            da3_times.append(da3_elapsed)
+            encoder_times.append(encoder_elapsed)
+            total_inference_times.append(iter_elapsed)
+    
+    # Save output (from last iteration)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     ply_file = output_path / "gaussians.ply"
@@ -1342,18 +1365,52 @@ def run_file_inference(
     
     total_elapsed = time.time() - total_start
     
+    # Compute statistics
+    def compute_stats(times: list) -> dict:
+        if not times:
+            return {"mean": 0, "std": 0, "min": 0, "max": 0}
+        arr = np.array(times)
+        return {
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr)),
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+        }
+    
+    da3_stats = compute_stats(da3_times)
+    encoder_stats = compute_stats(encoder_times)
+    total_stats = compute_stats(total_inference_times)
+    
     if verbose:
-        print(f"\n" + "="*50)
+        print(f"\n" + "="*70)
         print(f"TIMING SUMMARY")
-        print(f"="*50)
+        print(f"="*70)
+        print(f"Setup (one-time):")
         print(f"  Image loading:          {load_elapsed:.3f}s")
         print(f"  DepthAnything3 init:    {da3_init_elapsed:.3f}s")
         print(f"  DepthSplat init:        {encoder_init_elapsed:.3f}s")
-        print(f"  DepthAnything3 infer:   {da3_elapsed:.3f}s")
-        print(f"  DepthSplat infer:       {encoder_elapsed:.3f}s")
         print(f"  ---------------------------------")
-        print(f"  TOTAL:                  {total_elapsed:.3f}s")
-        print(f"="*50)
+        print(f"  Total setup:            {load_elapsed + da3_init_elapsed + encoder_init_elapsed:.3f}s")
+        
+        if num_iterations > 1:
+            print(f"\nInference Statistics ({num_iterations} iterations, excluding {warmup_iterations} warmup):")
+            print(f"  {'Component':<20} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
+            print(f"  {'-'*60}")
+            print(f"  {'DepthAnything3':<20} {da3_stats['mean']:>9.3f}s {da3_stats['std']:>9.3f}s {da3_stats['min']:>9.3f}s {da3_stats['max']:>9.3f}s")
+            print(f"  {'DepthSplat Encoder':<20} {encoder_stats['mean']:>9.3f}s {encoder_stats['std']:>9.3f}s {encoder_stats['min']:>9.3f}s {encoder_stats['max']:>9.3f}s")
+            print(f"  {'-'*60}")
+            print(f"  {'Total Inference':<20} {total_stats['mean']:>9.3f}s {total_stats['std']:>9.3f}s {total_stats['min']:>9.3f}s {total_stats['max']:>9.3f}s")
+            print(f"\n  Throughput: {1.0/total_stats['mean']:.2f} FPS (based on mean)")
+        else:
+            print(f"\nInference (single run):")
+            print(f"  DepthAnything3:         {da3_stats['mean']:.3f}s")
+            print(f"  DepthSplat Encoder:     {encoder_stats['mean']:.3f}s")
+            print(f"  ---------------------------------")
+            print(f"  Total inference:        {total_stats['mean']:.3f}s")
+            print(f"  Throughput:             {1.0/total_stats['mean']:.2f} FPS")
+        
+        print(f"\n  Total wall time:        {total_elapsed:.3f}s")
+        print(f"="*70)
         print(f"\n✓ Saved PLY to {ply_file}")
         print(f"  File size: {len(ply_bytes) / (1024*1024):.2f} MB")
     
@@ -1403,6 +1460,9 @@ def main():
 Examples:
   # File-based test mode (recommended for testing):
   python server.py --mode file --image-dir /workspace/input_images
+  
+  # File-based benchmarking with 10 iterations and 2 warmup runs:
+  python server.py --mode file --image-dir /workspace/input_images --iterations 10 --warmup 2
   
   # GStreamer test mode - process 5 frame pairs then exit:
   python server.py --mode test --num-frames 5
@@ -1480,6 +1540,18 @@ Examples:
         action="store_true",
         help="Reduce verbosity"
     )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+        help="Number of inference iterations for benchmarking in file mode (default: 1)"
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=1,
+        help="Number of warmup iterations before timing in file mode (default: 1)"
+    )
     
     args = parser.parse_args()
     
@@ -1490,12 +1562,15 @@ Examples:
         print("="*70)
         print(f"Image directory: {args.image_dir}")
         print(f"Output directory: {args.output_dir}")
+        print(f"Iterations: {args.iterations} (+ {args.warmup} warmup)")
         print("="*70 + "\n")
         
         run_file_inference(
             image_dir=args.image_dir,
             output_dir=args.output_dir,
             verbose=not args.quiet,
+            num_iterations=args.iterations,
+            warmup_iterations=args.warmup,
         )
         return
     
