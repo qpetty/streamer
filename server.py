@@ -50,6 +50,7 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GstApp', '1.0')
 from gi.repository import Gst, GstApp, GLib
 
+import sys
 import threading
 import queue
 import time
@@ -60,6 +61,32 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable
 from collections import OrderedDict
 import io
+
+# ============================================================================
+# Import DepthSplat inference from ../depthsplat
+# ============================================================================
+
+# Add depthsplat directory to Python path
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+_DEPTHSPLAT_DIR = (_SCRIPT_DIR.parent / "depthsplat").resolve()
+
+if not _DEPTHSPLAT_DIR.exists():
+    raise ImportError(
+        f"DepthSplat directory not found at: {_DEPTHSPLAT_DIR}\n"
+        f"Expected directory structure:\n"
+        f"  {_SCRIPT_DIR.parent}/\n"
+        f"    ├── streamserver/  (this server)\n"
+        f"    └── depthsplat/    (DepthSplat inference code)"
+    )
+
+sys.path.insert(0, str(_DEPTHSPLAT_DIR))
+
+# Import the inference module and reconfigure paths to be absolute
+import inference as _depthsplat_inference
+
+# Make paths absolute relative to depthsplat directory
+_depthsplat_inference.CHECKPOINT_PATH = str(_DEPTHSPLAT_DIR / _depthsplat_inference.CHECKPOINT_PATH)
+_depthsplat_inference.CONFIG_ROOT = str(_DEPTHSPLAT_DIR / "config")
 
 from inference import DepthSplatInference, InferenceConfig
 
