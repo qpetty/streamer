@@ -1210,8 +1210,12 @@ def run_file_inference(
     """
     from PIL import Image
     
+    total_start = time.time()
+    
     # Load images
+    load_start = time.time()
     images_data = load_test_images(image_dir)
+    load_elapsed = time.time() - load_start
     
     if len(images_data) < 2:
         raise ValueError(f"Need at least 2 images for inference, found {len(images_data)}")
@@ -1224,6 +1228,7 @@ def run_file_inference(
         print(f"Using images:")
         print(f"  Camera 0: {path_0} ({frame_0.shape})")
         print(f"  Camera 1: {path_1} ({frame_1.shape})")
+        print(f"  Image loading time: {load_elapsed:.3f}s")
     
     # Initialize models
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1231,27 +1236,39 @@ def run_file_inference(
     if verbose:
         print(f"\nInitializing DepthAnything3...")
     
+    da3_init_start = time.time()
     depth_anything = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE")
     depth_anything = depth_anything.to(device=device)
     depth_anything.eval()
+    da3_init_elapsed = time.time() - da3_init_start
     
     if verbose:
-        print(f"Initializing DepthSplat encoder...")
+        print(f"  DepthAnything3 init time: {da3_init_elapsed:.3f}s")
+        print(f"\nInitializing DepthSplat encoder...")
     
+    encoder_init_start = time.time()
     encoder = DepthSplatInference()
+    encoder_init_elapsed = time.time() - encoder_init_start
+    
+    if verbose:
+        print(f"  DepthSplat encoder init time: {encoder_init_elapsed:.3f}s")
     
     # Get original dimensions
     orig_height, orig_width = frame_0.shape[:2]
     
     if verbose:
-        print(f"\nRunning DepthAnything3 inference...")
+        print(f"\n" + "="*50)
+        print(f"Running DepthAnything3 inference...")
+        print(f"="*50)
     
     # Run DepthAnything3
+    da3_start = time.time()
     prediction = depth_anything.inference(
         image=[frame_0, frame_1],
         process_res=504,
         process_res_method="upper_bound_resize",
     )
+    da3_elapsed = time.time() - da3_start
     
     # Get processed size
     processed_height, processed_width = prediction.processed_images.shape[1:3]
@@ -1259,6 +1276,7 @@ def run_file_inference(
     if verbose:
         print(f"  Processed images size: {processed_width}x{processed_height}")
         print(f"  Original images size: {orig_width}x{orig_height}")
+        print(f"  >>> DepthAnything3 inference time: {da3_elapsed:.3f}s <<<")
     
     # Convert W2C to C2W
     w2c = prediction.extrinsics
@@ -1287,9 +1305,12 @@ def run_file_inference(
     images = torch.stack([frame_0_tensor, frame_1_tensor], dim=0)
     
     if verbose:
-        print(f"\nRunning DepthSplat encoder...")
+        print(f"\n" + "="*50)
+        print(f"Running DepthSplat encoder...")
+        print(f"="*50)
     
     # Run encoder
+    encoder_start = time.time()
     inference_config = InferenceConfig(
         target_height=512,
         target_width=960,
@@ -1306,6 +1327,10 @@ def run_file_inference(
         image_filenames=[Path(path_0).name, Path(path_1).name],
         config=inference_config,
     )
+    encoder_elapsed = time.time() - encoder_start
+    
+    if verbose:
+        print(f"  >>> DepthSplat encoder time: {encoder_elapsed:.3f}s <<<")
     
     # Save output
     output_path = Path(output_dir)
@@ -1315,7 +1340,20 @@ def run_file_inference(
     with open(ply_file, 'wb') as f:
         f.write(ply_bytes)
     
+    total_elapsed = time.time() - total_start
+    
     if verbose:
+        print(f"\n" + "="*50)
+        print(f"TIMING SUMMARY")
+        print(f"="*50)
+        print(f"  Image loading:          {load_elapsed:.3f}s")
+        print(f"  DepthAnything3 init:    {da3_init_elapsed:.3f}s")
+        print(f"  DepthSplat init:        {encoder_init_elapsed:.3f}s")
+        print(f"  DepthAnything3 infer:   {da3_elapsed:.3f}s")
+        print(f"  DepthSplat infer:       {encoder_elapsed:.3f}s")
+        print(f"  ---------------------------------")
+        print(f"  TOTAL:                  {total_elapsed:.3f}s")
+        print(f"="*50)
         print(f"\n✓ Saved PLY to {ply_file}")
         print(f"  File size: {len(ply_bytes) / (1024*1024):.2f} MB")
     
