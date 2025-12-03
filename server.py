@@ -182,9 +182,12 @@ class ServerConfig:
     # --- Output Settings ---
     output_dir: str = "stream-output"
     
-    # Callback for PLY output (if None, saves to files)
-    # Signature: callback(sequence_id: int, ply_bytes: bytes)
-    ply_callback: Optional[Callable[[int, bytes], None]] = None
+    # Output format: "spz" (compressed, ~10x smaller) or "ply" (standard)
+    output_format: str = "spz"
+    
+    # Callback for output (if None, saves to files)
+    # Signature: callback(sequence_id: int, output_bytes: bytes)
+    output_callback: Optional[Callable[[int, bytes], None]] = None
     
     # --- Near/Far Plane Settings ---
     near_disparity: float = 1.0
@@ -572,9 +575,10 @@ class GPUWorker:
                 near_disparity=self.config.near_disparity,
                 far_disparity=self.config.far_disparity,
                 verbose=False,  # Suppress verbose output in streaming mode
+                output_format=self.config.output_format,
             )
             
-            ply_bytes = self.encoder.run_from_data(
+            output_bytes = self.encoder.run_from_data(
                 images=images,
                 intrinsics_list=intrinsics_list,
                 extrinsics_list=extrinsics_list,
@@ -590,7 +594,7 @@ class GPUWorker:
                 print(f"[Worker {self.gpu_id}:{self.worker_id}] Encoder took {encoder_elapsed:.3f}s, total {total_elapsed:.3f}s for seq {seq_id}")
             
             # Invoke callback with result
-            result_callback(seq_id, ply_bytes)
+            result_callback(seq_id, output_bytes)
             
         except Exception as e:
             print(f"[Worker {self.gpu_id}:{self.worker_id}] Failed to process seq {seq_id}: {e}")
@@ -694,38 +698,39 @@ class OutputSequencer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.on_complete = on_complete  # Callback when a PLY is emitted
         
-    def add_result(self, seq_id: int, ply_bytes: bytes):
+    def add_result(self, seq_id: int, output_bytes: bytes):
         """
         Add a result and emit any ready sequences.
         
         Args:
             seq_id: Sequence ID of the result
-            ply_bytes: PLY file contents
+            output_bytes: Output file contents (SPZ or PLY)
         """
         with self.lock:
-            self.buffer[seq_id] = ply_bytes
+            self.buffer[seq_id] = output_bytes
             self._emit_ready()
             
     def _emit_ready(self):
         """Emit all ready sequences in order."""
         while self.next_seq_to_emit in self.buffer:
             seq_id = self.next_seq_to_emit
-            ply_bytes = self.buffer.pop(seq_id)
+            output_bytes = self.buffer.pop(seq_id)
             
             # Emit via callback or save to file
-            if self.config.ply_callback:
+            if self.config.output_callback:
                 try:
-                    self.config.ply_callback(seq_id, ply_bytes)
+                    self.config.output_callback(seq_id, output_bytes)
                 except Exception as e:
-                    print(f"PLY callback error for seq {seq_id}: {e}")
+                    print(f"Output callback error for seq {seq_id}: {e}")
             else:
-                # Save to file
-                output_path = self.output_dir / f"output_{seq_id:06d}.ply"
+                # Save to file with appropriate extension
+                ext = self.config.output_format.lower()
+                output_path = self.output_dir / f"output_{seq_id:06d}.{ext}"
                 with open(output_path, 'wb') as f:
-                    f.write(ply_bytes)
+                    f.write(output_bytes)
                 
                 if self.config.verbose:
-                    size_mb = len(ply_bytes) / (1024 * 1024)
+                    size_mb = len(output_bytes) / (1024 * 1024)
                     print(f"[Output] Saved seq {seq_id} to {output_path} ({size_mb:.2f} MB)")
             
             self.next_seq_to_emit += 1
@@ -1195,6 +1200,7 @@ def run_file_inference(
     verbose: bool = True,
     num_iterations: int = 1,
     warmup_iterations: int = 1,
+    output_format: str = "spz",
 ) -> bytes:
     """
     Run inference on images from a directory with optional multiple iterations for benchmarking.
@@ -1204,13 +1210,14 @@ def run_file_inference(
     
     Args:
         image_dir: Directory containing at least 2 images
-        output_dir: Directory to save output PLY file
+        output_dir: Directory to save output file
         verbose: Print progress
         num_iterations: Number of inference iterations to run for benchmarking (default: 1)
         warmup_iterations: Number of warmup iterations before timing (default: 1)
+        output_format: Output format - "spz" (compressed, default) or "ply"
         
     Returns:
-        PLY file contents as bytes (from the last iteration)
+        Output file contents as bytes (from the last iteration)
     """
     from PIL import Image
     
@@ -1272,6 +1279,7 @@ def run_file_inference(
         near_disparity=1.0,
         far_disparity=0.1,
         verbose=False,  # Suppress per-iteration verbose output
+        output_format=output_format,
     )
     
     # Storage for timing statistics
@@ -1286,7 +1294,7 @@ def run_file_inference(
         print(f"BENCHMARK: {warmup_iterations} warmup + {num_iterations} timed iterations")
         print(f"="*70)
     
-    ply_bytes = None
+    output_bytes = None
     
     for iteration in range(total_iterations):
         is_warmup = iteration < warmup_iterations
@@ -1329,7 +1337,7 @@ def run_file_inference(
         
         # Run encoder
         encoder_start = time.time()
-        ply_bytes = encoder.run_from_data(
+        output_bytes = encoder.run_from_data(
             images=images,
             intrinsics_list=[scaled_intrinsics[0], scaled_intrinsics[1]],
             extrinsics_list=[c2w[0], c2w[1]],
@@ -1358,10 +1366,11 @@ def run_file_inference(
     # Save output (from last iteration)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    ply_file = output_path / "gaussians.ply"
+    ext = output_format.lower()
+    output_file = output_path / f"gaussians.{ext}"
     
-    with open(ply_file, 'wb') as f:
-        f.write(ply_bytes)
+    with open(output_file, 'wb') as f:
+        f.write(output_bytes)
     
     total_elapsed = time.time() - total_start
     
@@ -1411,10 +1420,10 @@ def run_file_inference(
         
         print(f"\n  Total wall time:        {total_elapsed:.3f}s")
         print(f"="*70)
-        print(f"\n✓ Saved PLY to {ply_file}")
-        print(f"  File size: {len(ply_bytes) / (1024*1024):.2f} MB")
+        print(f"\n✓ Saved {output_format.upper()} to {output_file}")
+        print(f"  File size: {len(output_bytes) / (1024*1024):.2f} MB")
     
-    return ply_bytes
+    return output_bytes
 
 
 def create_v4l2_config(device_0: str = "/dev/video0", device_1: str = "/dev/video2") -> ServerConfig:
@@ -1552,6 +1561,12 @@ Examples:
         default=1,
         help="Number of warmup iterations before timing in file mode (default: 1)"
     )
+    parser.add_argument(
+        "--format",
+        choices=["spz", "ply"],
+        default="spz",
+        help="Output format: 'spz' (compressed, default) or 'ply' (standard)"
+    )
     
     args = parser.parse_args()
     
@@ -1562,6 +1577,7 @@ Examples:
         print("="*70)
         print(f"Image directory: {args.image_dir}")
         print(f"Output directory: {args.output_dir}")
+        print(f"Output format: {args.format.upper()}")
         print(f"Iterations: {args.iterations} (+ {args.warmup} warmup)")
         print("="*70 + "\n")
         
@@ -1571,6 +1587,7 @@ Examples:
             verbose=not args.quiet,
             num_iterations=args.iterations,
             warmup_iterations=args.warmup,
+            output_format=args.format,
         )
         return
     
@@ -1598,6 +1615,7 @@ Examples:
         config.max_frame_pairs = args.num_frames
         
     config.output_dir = args.output_dir
+    config.output_format = args.format
     config.verbose = not args.quiet
     
     # Start server
