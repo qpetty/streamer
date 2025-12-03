@@ -7,7 +7,8 @@ This server:
 - Synchronizes frames from both cameras before processing
 - Distributes workload across available GPUs
 - Supports throttling and frame skipping
-- Outputs PLY files in correct sequential order
+- Outputs PLY/SPZ files in correct sequential order
+- Supports WebSocket streaming to remote clients (Mac, Vision Pro, web)
 
 Pipeline:
     1. Camera frames captured via GStreamer (or loaded from files in test mode)
@@ -59,6 +60,26 @@ Configuration:
 Throttling/Skipping:
     --frame-skip N    Process every Nth frame (default: 1 = all frames)
     --max-fps F       Maximum processing rate in FPS (default: unlimited)
+
+WebSocket Streaming:
+    Enable with --websocket flag to stream outputs to remote clients:
+    
+    # File mode with WebSocket streaming (stream + save files)
+    python server.py --mode file --image-dir /path/to/images --websocket
+    
+    # File mode with WebSocket only (no file saving)
+    python server.py --mode file --image-dir /path/to/images --websocket --ws-only
+    
+    # GStreamer mode with WebSocket streaming
+    python server.py --mode test --websocket --ws-port 8765
+    
+    # GStreamer mode with WebSocket only
+    python server.py --mode test --websocket --ws-only
+    
+    Clients connect to ws://server_ip:8765 and receive binary messages:
+        [4 bytes: seq_id][4 bytes: format_type][4 bytes: length][N bytes: SPZ/PLY data]
+    
+    See websocket_streamer.py for full client implementation guide.
 """
 
 import gi
@@ -185,9 +206,12 @@ class ServerConfig:
     # Output format: "spz" (compressed, ~10x smaller) or "ply" (standard)
     output_format: str = "spz"
     
-    # Callback for output (if None, saves to files)
+    # Callback for output (called in addition to file saving if save_files=True)
     # Signature: callback(sequence_id: int, output_bytes: bytes)
     output_callback: Optional[Callable[[int, bytes], None]] = None
+    
+    # Whether to save output files to disk (set False for streaming-only mode)
+    save_files: bool = True
     
     # --- Near/Far Plane Settings ---
     near_disparity: float = 1.0
@@ -688,14 +712,29 @@ class OutputSequencer:
     sequences have been received.
     """
     
-    def __init__(self, config: ServerConfig, on_complete: Optional[Callable[[int], None]] = None):
+    def __init__(
+        self,
+        config: ServerConfig,
+        on_complete: Optional[Callable[[int], None]] = None,
+        save_files: bool = True,
+    ):
+        """
+        Initialize output sequencer.
+        
+        Args:
+            config: Server configuration
+            on_complete: Callback when a frame is emitted (receives total count)
+            save_files: Whether to save files to disk (can be False for streaming-only)
+        """
         self.config = config
         self.buffer: dict[int, bytes] = {}
         self.next_seq_to_emit = 0
         self.total_emitted = 0
         self.lock = threading.Lock()
+        self.save_files = save_files
         self.output_dir = Path(config.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.save_files:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
         self.on_complete = on_complete  # Callback when a PLY is emitted
         
     def add_result(self, seq_id: int, output_bytes: bytes):
@@ -716,14 +755,15 @@ class OutputSequencer:
             seq_id = self.next_seq_to_emit
             output_bytes = self.buffer.pop(seq_id)
             
-            # Emit via callback or save to file
+            # Emit via callback (e.g., WebSocket streaming)
             if self.config.output_callback:
                 try:
                     self.config.output_callback(seq_id, output_bytes)
                 except Exception as e:
                     print(f"Output callback error for seq {seq_id}: {e}")
-            else:
-                # Save to file with appropriate extension
+            
+            # Save to file if enabled
+            if self.save_files:
                 ext = self.config.output_format.lower()
                 output_path = self.output_dir / f"output_{seq_id:06d}.{ext}"
                 with open(output_path, 'wb') as f:
@@ -929,7 +969,11 @@ class DepthSplatServer:
                 print(f"\n[Complete] Processed {total_emitted} frame pairs")
                 self._request_stop()
         
-        self.output_sequencer = OutputSequencer(self.config, on_complete=on_output_complete)
+        self.output_sequencer = OutputSequencer(
+            self.config,
+            on_complete=on_output_complete,
+            save_files=self.config.save_files,
+        )
         self.worker_pool = GPUWorkerPool(self.config)
         self.worker_pool.start()
         
@@ -1201,6 +1245,8 @@ def run_file_inference(
     num_iterations: int = 1,
     warmup_iterations: int = 1,
     output_format: str = "spz",
+    output_callback: Optional[Callable[[int, bytes], None]] = None,
+    save_files: bool = True,
 ) -> bytes:
     """
     Run inference on images from a directory with optional multiple iterations for benchmarking.
@@ -1215,6 +1261,8 @@ def run_file_inference(
         num_iterations: Number of inference iterations to run for benchmarking (default: 1)
         warmup_iterations: Number of warmup iterations before timing (default: 1)
         output_format: Output format - "spz" (compressed, default) or "ply"
+        output_callback: Optional callback for streaming output (seq_id, bytes)
+        save_files: Whether to save output files to disk (default: True)
         
     Returns:
         Output file contents as bytes (from the last iteration)
@@ -1362,15 +1410,25 @@ def run_file_inference(
             da3_times.append(da3_elapsed)
             encoder_times.append(encoder_elapsed)
             total_inference_times.append(iter_elapsed)
+            
+            # Call output callback if provided (for WebSocket streaming, etc.)
+            if output_callback:
+                seq_id = iteration - warmup_iterations
+                try:
+                    output_callback(seq_id, output_bytes)
+                except Exception as e:
+                    print(f"Output callback error for seq {seq_id}: {e}")
     
-    # Save output (from last iteration)
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    ext = output_format.lower()
-    output_file = output_path / f"gaussians.{ext}"
-    
-    with open(output_file, 'wb') as f:
-        f.write(output_bytes)
+    # Save output (from last iteration) if file saving is enabled
+    output_file = None
+    if save_files:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        ext = output_format.lower()
+        output_file = output_path / f"gaussians.{ext}"
+        
+        with open(output_file, 'wb') as f:
+            f.write(output_bytes)
     
     total_elapsed = time.time() - total_start
     
@@ -1420,7 +1478,10 @@ def run_file_inference(
         
         print(f"\n  Total wall time:        {total_elapsed:.3f}s")
         print(f"="*70)
-        print(f"\n✓ Saved {output_format.upper()} to {output_file}")
+        if output_file:
+            print(f"\n✓ Saved {output_format.upper()} to {output_file}")
+        if output_callback:
+            print(f"\n✓ Streamed {num_iterations} frame(s) via callback")
         print(f"  File size: {len(output_bytes) / (1024*1024):.2f} MB")
     
     return output_bytes
@@ -1568,6 +1629,29 @@ Examples:
         help="Output format: 'spz' (compressed, default) or 'ply' (standard)"
     )
     
+    # WebSocket streaming arguments
+    parser.add_argument(
+        "--websocket",
+        action="store_true",
+        help="Enable WebSocket streaming to remote clients"
+    )
+    parser.add_argument(
+        "--ws-host",
+        default="0.0.0.0",
+        help="WebSocket server host (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--ws-port",
+        type=int,
+        default=8765,
+        help="WebSocket server port (default: 8765)"
+    )
+    parser.add_argument(
+        "--ws-only",
+        action="store_true",
+        help="Only stream via WebSocket, don't save files to disk"
+    )
+    
     args = parser.parse_args()
     
     # File-based test mode - runs without GStreamer
@@ -1579,16 +1663,54 @@ Examples:
         print(f"Output directory: {args.output_dir}")
         print(f"Output format: {args.format.upper()}")
         print(f"Iterations: {args.iterations} (+ {args.warmup} warmup)")
+        
+        # Initialize WebSocket streamer if enabled
+        websocket_streamer = None
+        output_callback = None
+        save_files = True
+        
+        if args.websocket:
+            try:
+                from websocket_streamer import WebSocketStreamer
+                
+                websocket_streamer = WebSocketStreamer(
+                    host=args.ws_host,
+                    port=args.ws_port,
+                    output_format=args.format,
+                    verbose=not args.quiet,
+                )
+                websocket_streamer.start()
+                
+                output_callback = websocket_streamer.broadcast_frame
+                
+                print(f"\nWebSocket streaming enabled:")
+                print(f"  URL: ws://{args.ws_host}:{args.ws_port}")
+                if args.ws_only:
+                    print(f"  Mode: WebSocket only (no files saved)")
+                    save_files = False
+                else:
+                    print(f"  Mode: WebSocket + file output")
+                    
+            except ImportError as e:
+                print(f"Warning: Could not enable WebSocket streaming: {e}")
+                print("Install websockets with: pip install websockets")
+        
         print("="*70 + "\n")
         
-        run_file_inference(
-            image_dir=args.image_dir,
-            output_dir=args.output_dir,
-            verbose=not args.quiet,
-            num_iterations=args.iterations,
-            warmup_iterations=args.warmup,
-            output_format=args.format,
-        )
+        try:
+            run_file_inference(
+                image_dir=args.image_dir,
+                output_dir=args.output_dir,
+                verbose=not args.quiet,
+                num_iterations=args.iterations,
+                warmup_iterations=args.warmup,
+                output_format=args.format,
+                output_callback=output_callback,
+                save_files=save_files,
+            )
+        finally:
+            if websocket_streamer:
+                websocket_streamer.stop()
         return
     
     # GStreamer-based modes
@@ -1618,9 +1740,49 @@ Examples:
     config.output_format = args.format
     config.verbose = not args.quiet
     
+    # Initialize WebSocket streamer if enabled
+    websocket_streamer = None
+    if args.websocket:
+        try:
+            from websocket_streamer import WebSocketStreamer
+            
+            websocket_streamer = WebSocketStreamer(
+                host=args.ws_host,
+                port=args.ws_port,
+                output_format=args.format,
+                verbose=not args.quiet,
+            )
+            websocket_streamer.start()
+            
+            print(f"\n{'='*70}")
+            print(f"WebSocket streaming enabled")
+            print(f"  URL: ws://{args.ws_host}:{args.ws_port}")
+            print(f"  Format: {args.format.upper()}")
+            if args.ws_only:
+                print(f"  Mode: WebSocket only (no files saved)")
+            else:
+                print(f"  Mode: WebSocket + file output")
+            print(f"{'='*70}\n")
+            
+            # Set the WebSocket broadcast as the output callback
+            config.output_callback = websocket_streamer.broadcast_frame
+            
+            # Disable file saving if --ws-only is specified
+            if args.ws_only:
+                config.save_files = False
+                
+        except ImportError as e:
+            print(f"Warning: Could not enable WebSocket streaming: {e}")
+            print("Install websockets with: pip install websockets")
+    
     # Start server
     server = DepthSplatServer(config)
-    server.start()
+    try:
+        server.start()
+    finally:
+        # Clean up WebSocket streamer
+        if websocket_streamer:
+            websocket_streamer.stop()
 
 
 if __name__ == "__main__":
