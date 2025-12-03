@@ -82,7 +82,7 @@ HEADER_SIZE = 12
 PROTOCOL_VERSION = 1
 
 
-@dataclass
+@dataclass(eq=False)
 class ClientState:
     """State for a connected WebSocket client."""
     websocket: 'ServerConnection'
