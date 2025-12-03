@@ -3,10 +3,23 @@ GStreamer-based server for DepthSplat inference with dual camera streams.
 
 This server:
 - Accepts 2 simultaneous camera input streams via GStreamer
+- Uses DepthAnything3 to estimate camera intrinsics and extrinsics (poses)
 - Synchronizes frames from both cameras before processing
 - Distributes workload across available GPUs
 - Supports throttling and frame skipping
 - Outputs PLY files in correct sequential order
+
+Pipeline:
+    1. Camera frames captured via GStreamer (or loaded from files in test mode)
+    2. DepthAnything3 estimates intrinsics and W2C extrinsics from frames
+    3. W2C extrinsics are converted to C2W poses for DepthSplat
+    4. Intrinsics are scaled from DepthAnything3's processed size to original input size
+    5. DepthSplat encoder generates Gaussian splats using the original images + estimated cameras
+
+Note on terminology:
+    - DepthAnything3 outputs "extrinsics" in W2C (world-to-camera) format
+    - DepthSplat's "extrinsics" parameter actually expects C2W (camera-to-world) poses
+    - We convert W2C → C2W by taking the matrix inverse
 
 GStreamer Documentation: https://gstreamer.freedesktop.org/documentation/?gi-language=c
 
@@ -25,7 +38,10 @@ Requirements:
         gir1.2-gst-plugins-base-1.0
 
 Usage:
-    # Test mode (uses test patterns, no real cameras needed):
+    # File-based test mode (recommended for testing, no GStreamer needed):
+    python server.py --mode file --image-dir /workspace/input_images
+    
+    # GStreamer test mode (uses test patterns, no real cameras needed):
     python server.py --mode test
     
     # V4L2 cameras:
@@ -89,6 +105,27 @@ _depthsplat_inference.CHECKPOINT_PATH = str(_DEPTHSPLAT_DIR / _depthsplat_infere
 _depthsplat_inference.CONFIG_ROOT = str(_DEPTHSPLAT_DIR / "config")
 
 from inference import DepthSplatInference, InferenceConfig
+
+
+# ============================================================================
+# Import DepthAnything3 for camera intrinsics/extrinsics estimation
+# ============================================================================
+
+_DEPTH_ANYTHING_DIR = (_SCRIPT_DIR.parent / "Depth-Anything-3" / "src").resolve()
+
+if not _DEPTH_ANYTHING_DIR.exists():
+    raise ImportError(
+        f"Depth-Anything-3 directory not found at: {_DEPTH_ANYTHING_DIR}\n"
+        f"Expected directory structure:\n"
+        f"  {_SCRIPT_DIR.parent}/\n"
+        f"    ├── streamer/       (this server)\n"
+        f"    ├── depthsplat/     (DepthSplat inference code)\n"
+        f"    └── Depth-Anything-3/src/  (DepthAnything3 code)"
+    )
+
+sys.path.insert(0, str(_DEPTH_ANYTHING_DIR))
+
+from depth_anything_3.api import DepthAnything3
 
 # ============================================================================
 # Configuration - Modify these settings as needed
@@ -160,6 +197,18 @@ class ServerConfig:
     # --- Sync Settings ---
     # Use frame count sync instead of timestamp sync (better for test sources)
     use_frame_count_sync: bool = False
+    
+    # --- DepthAnything3 Settings ---
+    # DepthAnything3 model name for camera estimation
+    depth_anything_model: str = "depth-anything/DA3NESTED-GIANT-LARGE"
+    
+    # Processing resolution for DepthAnything3 (504 is default)
+    depth_anything_process_res: int = 504
+    
+    # --- File-based Test Mode ---
+    # When set, load images from this directory instead of cameras
+    # Images should be named with _metadata.json sidecar files
+    test_images_dir: Optional[str] = None
 
 
 # Default configuration instance
@@ -167,38 +216,86 @@ CONFIG = ServerConfig()
 
 
 # ============================================================================
-# Camera Metadata Configuration
+# Camera Pose Utilities
 # ============================================================================
 
-# Default camera intrinsics and extrinsics for the two cameras
-# These should be calibrated for your actual camera setup
-# Format: intrinsics as 3x3 matrix, extrinsics as 4x4 camera-to-world matrix
+def w2c_to_c2w(w2c: np.ndarray) -> np.ndarray:
+    """
+    Convert world-to-camera (W2C) matrix to camera-to-world (C2W) matrix.
+    
+    DepthAnything3 outputs W2C (extrinsics), but DepthSplat expects C2W (poses).
+    
+    Args:
+        w2c: World-to-camera matrix [N, 3, 4] or [N, 4, 4] or [3, 4] or [4, 4]
+        
+    Returns:
+        Camera-to-world matrix [N, 4, 4] or [4, 4]
+    """
+    # Ensure 4x4 shape
+    if w2c.ndim == 2:
+        if w2c.shape == (3, 4):
+            w2c_4x4 = np.eye(4, dtype=w2c.dtype)
+            w2c_4x4[:3, :4] = w2c
+            w2c = w2c_4x4
+        c2w = np.linalg.inv(w2c).astype(np.float32)
+    elif w2c.ndim == 3:
+        n = w2c.shape[0]
+        if w2c.shape[1:] == (3, 4):
+            w2c_4x4 = np.zeros((n, 4, 4), dtype=w2c.dtype)
+            w2c_4x4[:, :3, :4] = w2c
+            w2c_4x4[:, 3, 3] = 1.0
+            w2c = w2c_4x4
+        c2w = np.linalg.inv(w2c).astype(np.float32)
+    else:
+        raise ValueError(f"Unexpected w2c shape: {w2c.shape}")
+    
+    return c2w
 
-DEFAULT_CAMERA_0_INTRINSICS = np.array([
-    [500.0, 0.0, 640.0],
-    [0.0, 500.0, 360.0],
-    [0.0, 0.0, 1.0]
-], dtype=np.float32)
 
-DEFAULT_CAMERA_0_EXTRINSICS = np.array([
-    [1.0, 0.0, 0.0, -0.1],  # Slightly left of center
-    [0.0, 1.0, 0.0, 0.0],
-    [0.0, 0.0, 1.0, 0.0],
-    [0.0, 0.0, 0.0, 1.0]
-], dtype=np.float32)
-
-DEFAULT_CAMERA_1_INTRINSICS = np.array([
-    [500.0, 0.0, 640.0],
-    [0.0, 500.0, 360.0],
-    [0.0, 0.0, 1.0]
-], dtype=np.float32)
-
-DEFAULT_CAMERA_1_EXTRINSICS = np.array([
-    [1.0, 0.0, 0.0, 0.1],  # Slightly right of center
-    [0.0, 1.0, 0.0, 0.0],
-    [0.0, 0.0, 1.0, 0.0],
-    [0.0, 0.0, 0.0, 1.0]
-], dtype=np.float32)
+def scale_intrinsics(
+    intrinsics: np.ndarray,
+    from_width: int,
+    from_height: int,
+    to_width: int,
+    to_height: int,
+) -> np.ndarray:
+    """
+    Scale intrinsics from one image size to another.
+    
+    DepthAnything3 outputs intrinsics for processed_images size.
+    We need to scale them to the original input image size for DepthSplat.
+    
+    Args:
+        intrinsics: Intrinsics matrix [N, 3, 3] or [3, 3]
+        from_width: Width of the image the intrinsics were computed for
+        from_height: Height of the image the intrinsics were computed for
+        to_width: Target width
+        to_height: Target height
+        
+    Returns:
+        Scaled intrinsics matrix [N, 3, 3] or [3, 3]
+    """
+    scale_x = to_width / from_width
+    scale_y = to_height / from_height
+    
+    scaled = intrinsics.copy()
+    
+    if intrinsics.ndim == 2:
+        # [3, 3]
+        scaled[0, 0] *= scale_x  # fx
+        scaled[0, 2] *= scale_x  # cx
+        scaled[1, 1] *= scale_y  # fy
+        scaled[1, 2] *= scale_y  # cy
+    elif intrinsics.ndim == 3:
+        # [N, 3, 3]
+        scaled[:, 0, 0] *= scale_x  # fx
+        scaled[:, 0, 2] *= scale_x  # cx
+        scaled[:, 1, 1] *= scale_y  # fy
+        scaled[:, 1, 2] *= scale_y  # cy
+    else:
+        raise ValueError(f"Unexpected intrinsics shape: {intrinsics.shape}")
+    
+    return scaled.astype(np.float32)
 
 
 # ============================================================================
@@ -328,11 +425,12 @@ class GPUWorker:
         self.gpu_id = gpu_id
         self.worker_id = worker_id
         self.config = config
-        self.model: Optional[DepthSplatInference] = None
+        self.encoder: Optional[DepthSplatInference] = None
+        self.depth_anything: Optional[DepthAnything3] = None
         self.task_queue = queue.Queue()
         self.running = False
         self.thread: Optional[threading.Thread] = None
-        self.ready_event = threading.Event()  # Signals when model is loaded
+        self.ready_event = threading.Event()  # Signals when models are loaded
         
     def start(self):
         """Start the worker thread."""
@@ -346,7 +444,7 @@ class GPUWorker:
         self.thread.start()
     
     def wait_ready(self, timeout: float = None) -> bool:
-        """Wait for the worker to be ready (model loaded)."""
+        """Wait for the worker to be ready (models loaded)."""
         return self.ready_event.wait(timeout=timeout)
         
     def stop(self):
@@ -362,16 +460,26 @@ class GPUWorker:
         
     def _run(self):
         """Worker thread main loop."""
-        # Initialize model on this GPU
+        # Initialize models on this GPU
         torch.cuda.set_device(self.gpu_id)
+        device = torch.device(f"cuda:{self.gpu_id}")
         
         if self.config.verbose:
-            print(f"[Worker {self.gpu_id}:{self.worker_id}] Initializing model on GPU {self.gpu_id}")
+            print(f"[Worker {self.gpu_id}:{self.worker_id}] Initializing DepthAnything3 on GPU {self.gpu_id}")
         
-        self.model = DepthSplatInference()
+        # Initialize DepthAnything3 for camera estimation
+        self.depth_anything = DepthAnything3.from_pretrained(self.config.depth_anything_model)
+        self.depth_anything = self.depth_anything.to(device=device)
+        self.depth_anything.eval()
         
         if self.config.verbose:
-            print(f"[Worker {self.gpu_id}:{self.worker_id}] Ready")
+            print(f"[Worker {self.gpu_id}:{self.worker_id}] Initializing DepthSplat encoder on GPU {self.gpu_id}")
+        
+        # Initialize DepthSplat encoder
+        self.encoder = DepthSplatInference()
+        
+        if self.config.verbose:
+            print(f"[Worker {self.gpu_id}:{self.worker_id}] Both models ready")
         
         # Signal that we're ready
         self.ready_event.set()
@@ -395,32 +503,69 @@ class GPUWorker:
         try:
             start_time = time.time()
             
-            # Extract frames and convert to tensors
+            # Extract frames - HWC uint8 numpy arrays
             frame_0 = frames_dict[0][1]  # (timestamp, frame) -> frame
             frame_1 = frames_dict[1][1]
             
+            # Get original image dimensions
+            orig_height, orig_width = frame_0.shape[:2]
+            
+            if self.config.verbose:
+                print(f"[Worker {self.gpu_id}:{self.worker_id}] Running DepthAnything3 on seq {seq_id}")
+            
+            # Run DepthAnything3 to get intrinsics and extrinsics (W2C)
+            # Pass numpy arrays directly - DepthAnything3 accepts HWC uint8 arrays
+            da3_start = time.time()
+            prediction = self.depth_anything.inference(
+                image=[frame_0, frame_1],  # List of HWC uint8 numpy arrays
+                process_res=self.config.depth_anything_process_res,
+                process_res_method="upper_bound_resize",
+            )
+            da3_elapsed = time.time() - da3_start
+            
+            if self.config.verbose:
+                print(f"[Worker {self.gpu_id}:{self.worker_id}] DepthAnything3 took {da3_elapsed:.3f}s")
+            
+            # Get processed image size from DepthAnything3 for intrinsics scaling
+            processed_height, processed_width = prediction.processed_images.shape[1:3]
+            
+            # DepthAnything3 outputs W2C extrinsics - convert to C2W poses for DepthSplat
+            # DepthSplat's "extrinsics" parameter actually expects C2W (camera-to-world) poses
+            w2c_extrinsics = prediction.extrinsics  # [N, 3, 4] or [N, 4, 4] - W2C
+            c2w_poses = w2c_to_c2w(w2c_extrinsics)  # [N, 4, 4] - C2W
+            
+            # Scale intrinsics from processed_images size to original input size
+            da3_intrinsics = prediction.intrinsics  # [N, 3, 3] for processed size
+            scaled_intrinsics = scale_intrinsics(
+                da3_intrinsics,
+                from_width=processed_width,
+                from_height=processed_height,
+                to_width=orig_width,
+                to_height=orig_height,
+            )
+            
+            if self.config.verbose:
+                print(f"[Worker {self.gpu_id}:{self.worker_id}] Intrinsics scaled from {processed_width}x{processed_height} to {orig_width}x{orig_height}")
+            
+            # Convert frames to tensors for DepthSplat - use ORIGINAL images, not processed
             # Convert from HWC uint8 to CHW float [0, 1]
             frame_0_tensor = torch.from_numpy(frame_0).permute(2, 0, 1).float() / 255.0
             frame_1_tensor = torch.from_numpy(frame_1).permute(2, 0, 1).float() / 255.0
-            
-            # Stack frames
             images = torch.stack([frame_0_tensor, frame_1_tensor], dim=0)
             
-            # Prepare camera data
-            intrinsics_list = [
-                DEFAULT_CAMERA_0_INTRINSICS,
-                DEFAULT_CAMERA_1_INTRINSICS,
-            ]
-            extrinsics_list = [
-                DEFAULT_CAMERA_0_EXTRINSICS,
-                DEFAULT_CAMERA_1_EXTRINSICS,
-            ]
+            # Prepare lists for DepthSplat
+            intrinsics_list = [scaled_intrinsics[0], scaled_intrinsics[1]]
+            extrinsics_list = [c2w_poses[0], c2w_poses[1]]  # C2W poses
             original_sizes = [
-                (self.config.input_width, self.config.input_height),
-                (self.config.input_width, self.config.input_height),
+                (orig_width, orig_height),
+                (orig_width, orig_height),
             ]
             
-            # Run inference
+            if self.config.verbose:
+                print(f"[Worker {self.gpu_id}:{self.worker_id}] Running DepthSplat encoder on seq {seq_id}")
+            
+            # Run DepthSplat encoder inference
+            encoder_start = time.time()
             inference_config = InferenceConfig(
                 target_height=self.config.target_height,
                 target_width=self.config.target_width,
@@ -429,7 +574,7 @@ class GPUWorker:
                 verbose=False,  # Suppress verbose output in streaming mode
             )
             
-            ply_bytes = self.model.run_from_data(
+            ply_bytes = self.encoder.run_from_data(
                 images=images,
                 intrinsics_list=intrinsics_list,
                 extrinsics_list=extrinsics_list,
@@ -437,11 +582,12 @@ class GPUWorker:
                 image_filenames=[f"cam0_seq{seq_id}", f"cam1_seq{seq_id}"],
                 config=inference_config,
             )
+            encoder_elapsed = time.time() - encoder_start
             
-            elapsed = time.time() - start_time
+            total_elapsed = time.time() - start_time
             
             if self.config.verbose:
-                print(f"[Worker {self.gpu_id}:{self.worker_id}] Processed seq {seq_id} in {elapsed:.3f}s")
+                print(f"[Worker {self.gpu_id}:{self.worker_id}] Encoder took {encoder_elapsed:.3f}s, total {total_elapsed:.3f}s for seq {seq_id}")
             
             # Invoke callback with result
             result_callback(seq_id, ply_bytes)
@@ -964,30 +1110,39 @@ class DepthSplatServer:
 # Utility Functions
 # ============================================================================
 
-def set_camera_calibration(
-    camera_id: int,
-    intrinsics: np.ndarray,
-    extrinsics: np.ndarray,
-):
+def load_test_images(image_dir: str) -> list[tuple[np.ndarray, np.ndarray]]:
     """
-    Set camera calibration for a specific camera.
+    Load test images from a directory.
     
     Args:
-        camera_id: Camera index (0 or 1)
-        intrinsics: 3x3 intrinsic matrix
-        extrinsics: 4x4 camera-to-world matrix
+        image_dir: Directory containing images (jpg/png files)
+        
+    Returns:
+        List of (image, metadata_dict) tuples where image is HWC uint8 numpy array
     """
-    global DEFAULT_CAMERA_0_INTRINSICS, DEFAULT_CAMERA_0_EXTRINSICS
-    global DEFAULT_CAMERA_1_INTRINSICS, DEFAULT_CAMERA_1_EXTRINSICS
+    from PIL import Image
+    import json
     
-    if camera_id == 0:
-        DEFAULT_CAMERA_0_INTRINSICS = intrinsics.astype(np.float32)
-        DEFAULT_CAMERA_0_EXTRINSICS = extrinsics.astype(np.float32)
-    elif camera_id == 1:
-        DEFAULT_CAMERA_1_INTRINSICS = intrinsics.astype(np.float32)
-        DEFAULT_CAMERA_1_EXTRINSICS = extrinsics.astype(np.float32)
-    else:
-        raise ValueError(f"Invalid camera_id: {camera_id}. Must be 0 or 1.")
+    image_dir = Path(image_dir)
+    if not image_dir.exists():
+        raise FileNotFoundError(f"Image directory not found: {image_dir}")
+    
+    # Find all images
+    image_files = []
+    for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
+        image_files.extend(sorted(image_dir.glob(ext)))
+    
+    if not image_files:
+        raise ValueError(f"No image files found in: {image_dir}")
+    
+    results = []
+    for img_path in image_files:
+        # Load image
+        img = Image.open(img_path).convert('RGB')
+        img_array = np.array(img, dtype=np.uint8)
+        results.append((img_array, str(img_path)))
+    
+    return results
 
 
 def create_test_config(num_frames: int = 5, duration: float = 0.0) -> ServerConfig:
@@ -1012,6 +1167,159 @@ def create_test_config(num_frames: int = 5, duration: float = 0.0) -> ServerConf
         use_frame_count_sync=True,  # Use frame count sync for test sources
         verbose=True,
     )
+
+
+def create_file_test_config(image_dir: str) -> ServerConfig:
+    """
+    Create a test configuration for file-based testing.
+    
+    Args:
+        image_dir: Directory containing test images
+    """
+    return ServerConfig(
+        # These won't be used in file mode
+        camera_0_source="",
+        camera_1_source="",
+        input_width=960,
+        input_height=512,
+        input_framerate=1,
+        max_frame_pairs=1,  # Process one pair
+        verbose=True,
+        test_images_dir=image_dir,
+    )
+
+
+def run_file_inference(
+    image_dir: str,
+    output_dir: str = "stream-output",
+    verbose: bool = True,
+) -> bytes:
+    """
+    Run a single inference on images from a directory.
+    
+    This is a simplified function for testing with file-based images
+    without starting the full GStreamer server.
+    
+    Args:
+        image_dir: Directory containing at least 2 images
+        output_dir: Directory to save output PLY file
+        verbose: Print progress
+        
+    Returns:
+        PLY file contents as bytes
+    """
+    from PIL import Image
+    
+    # Load images
+    images_data = load_test_images(image_dir)
+    
+    if len(images_data) < 2:
+        raise ValueError(f"Need at least 2 images for inference, found {len(images_data)}")
+    
+    # Take first 2 images
+    frame_0, path_0 = images_data[0]
+    frame_1, path_1 = images_data[1]
+    
+    if verbose:
+        print(f"Using images:")
+        print(f"  Camera 0: {path_0} ({frame_0.shape})")
+        print(f"  Camera 1: {path_1} ({frame_1.shape})")
+    
+    # Initialize models
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if verbose:
+        print(f"\nInitializing DepthAnything3...")
+    
+    depth_anything = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE")
+    depth_anything = depth_anything.to(device=device)
+    depth_anything.eval()
+    
+    if verbose:
+        print(f"Initializing DepthSplat encoder...")
+    
+    encoder = DepthSplatInference()
+    
+    # Get original dimensions
+    orig_height, orig_width = frame_0.shape[:2]
+    
+    if verbose:
+        print(f"\nRunning DepthAnything3 inference...")
+    
+    # Run DepthAnything3
+    prediction = depth_anything.inference(
+        image=[frame_0, frame_1],
+        process_res=504,
+        process_res_method="upper_bound_resize",
+    )
+    
+    # Get processed size
+    processed_height, processed_width = prediction.processed_images.shape[1:3]
+    
+    if verbose:
+        print(f"  Processed images size: {processed_width}x{processed_height}")
+        print(f"  Original images size: {orig_width}x{orig_height}")
+    
+    # Convert W2C to C2W
+    w2c = prediction.extrinsics
+    c2w = w2c_to_c2w(w2c)
+    
+    if verbose:
+        print(f"  Converted W2C extrinsics to C2W poses")
+        print(f"  W2C shape: {w2c.shape}, C2W shape: {c2w.shape}")
+    
+    # Scale intrinsics
+    da3_intrinsics = prediction.intrinsics
+    scaled_intrinsics = scale_intrinsics(
+        da3_intrinsics,
+        from_width=processed_width,
+        from_height=processed_height,
+        to_width=orig_width,
+        to_height=orig_height,
+    )
+    
+    if verbose:
+        print(f"  Scaled intrinsics from {processed_width}x{processed_height} to {orig_width}x{orig_height}")
+    
+    # Convert frames to tensors
+    frame_0_tensor = torch.from_numpy(frame_0).permute(2, 0, 1).float() / 255.0
+    frame_1_tensor = torch.from_numpy(frame_1).permute(2, 0, 1).float() / 255.0
+    images = torch.stack([frame_0_tensor, frame_1_tensor], dim=0)
+    
+    if verbose:
+        print(f"\nRunning DepthSplat encoder...")
+    
+    # Run encoder
+    inference_config = InferenceConfig(
+        target_height=512,
+        target_width=960,
+        near_disparity=1.0,
+        far_disparity=0.1,
+        verbose=verbose,
+    )
+    
+    ply_bytes = encoder.run_from_data(
+        images=images,
+        intrinsics_list=[scaled_intrinsics[0], scaled_intrinsics[1]],
+        extrinsics_list=[c2w[0], c2w[1]],
+        original_sizes=[(orig_width, orig_height), (orig_width, orig_height)],
+        image_filenames=[Path(path_0).name, Path(path_1).name],
+        config=inference_config,
+    )
+    
+    # Save output
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    ply_file = output_path / "gaussians.ply"
+    
+    with open(ply_file, 'wb') as f:
+        f.write(ply_bytes)
+    
+    if verbose:
+        print(f"\n✓ Saved PLY to {ply_file}")
+        print(f"  File size: {len(ply_bytes) / (1024*1024):.2f} MB")
+    
+    return ply_bytes
 
 
 def create_v4l2_config(device_0: str = "/dev/video0", device_1: str = "/dev/video2") -> ServerConfig:
@@ -1051,14 +1359,17 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="DepthSplat GStreamer Server",
+        description="DepthSplat GStreamer Server with DepthAnything3 camera estimation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Test mode - process 5 frame pairs then exit:
+  # File-based test mode (recommended for testing):
+  python server.py --mode file --image-dir /workspace/input_images
+  
+  # GStreamer test mode - process 5 frame pairs then exit:
   python server.py --mode test --num-frames 5
   
-  # Test mode - run for 30 seconds:
+  # GStreamer test mode - run for 30 seconds:
   python server.py --mode test --duration 30
   
   # V4L2 cameras with throttling:
@@ -1070,9 +1381,14 @@ Examples:
     )
     parser.add_argument(
         "--mode",
-        choices=["test", "v4l2", "rtsp", "custom"],
-        default="test",
-        help="Camera mode (default: test)"
+        choices=["test", "file", "v4l2", "rtsp", "custom"],
+        default="file",
+        help="Camera mode (default: file)"
+    )
+    parser.add_argument(
+        "--image-dir",
+        default="/workspace/input_images",
+        help="Directory containing test images for file mode (default: /workspace/input_images)"
     )
     parser.add_argument(
         "--device0",
@@ -1129,6 +1445,23 @@ Examples:
     
     args = parser.parse_args()
     
+    # File-based test mode - runs without GStreamer
+    if args.mode == "file":
+        print("="*70)
+        print("File-based Test Mode")
+        print("="*70)
+        print(f"Image directory: {args.image_dir}")
+        print(f"Output directory: {args.output_dir}")
+        print("="*70 + "\n")
+        
+        run_file_inference(
+            image_dir=args.image_dir,
+            output_dir=args.output_dir,
+            verbose=not args.quiet,
+        )
+        return
+    
+    # GStreamer-based modes
     # Create configuration based on mode
     if args.mode == "test":
         config = create_test_config(num_frames=args.num_frames, duration=args.duration)
