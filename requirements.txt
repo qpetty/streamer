@@ -4,7 +4,7 @@
 websockets>=12.0
 
 # Core dependencies (usually already installed with depthsplat)
-numpy
-torch
-Pillow
+#numpy
+#torch
+#Pillow
 
