@@ -579,6 +579,32 @@
                     peerConnection.addTrack(track, localStream);
                 });
                 
+                // Configure high bitrate encoding for near-lossless quality
+                const senders = peerConnection.getSenders();
+                const videoSender = senders.find(s => s.track?.kind === 'video');
+                if (videoSender) {
+                    try {
+                        const params = videoSender.getParameters();
+                        if (!params.encodings || params.encodings.length === 0) {
+                            params.encodings = [{}];
+                        }
+                        
+                        // Set very high bitrate (15 Mbps) for near-lossless quality
+                        params.encodings[0].maxBitrate = 15000000;  // 15 Mbps max
+                        
+                        // Prevent WebRTC from downscaling resolution
+                        params.encodings[0].scaleResolutionDownBy = 1.0;
+                        
+                        // Request consistent framerate
+                        params.encodings[0].maxFramerate = 30;
+                        
+                        await videoSender.setParameters(params);
+                        log('Configured high bitrate encoding: 15 Mbps, no downscaling', 'success');
+                    } catch (e) {
+                        log(`Could not set encoding parameters: ${e.message}`, 'warning');
+                    }
+                }
+                
                 // Handle ICE candidates
                 peerConnection.onicecandidate = (event) => {
                     if (event.candidate) {

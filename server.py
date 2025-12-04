@@ -893,7 +893,7 @@ class CameraPipeline:
         
         pipeline = (
             f"{self.source_pipeline} ! "
-            f"videoscale ! "
+            f"videoscale method=4 ! "  # method=4 is Lanczos (highest quality)
             f"video/x-raw,width={width},height={height} ! "
             f"videorate ! "
             f"video/x-raw,framerate={framerate}/1 ! "
@@ -1006,6 +1006,7 @@ class WebRTCCameraPipeline:
         self.pipeline: Optional[Gst.Pipeline] = None
         self.webrtcbin: Optional[Gst.Element] = None
         self.frame_count = 0
+        self.raw_frame_count = 0  # Counter for raw frames (before scaling)
         self.websocket = None  # Will be set when client connects
         self.connected = False  # True when WebRTC connection is established
         self.lock = threading.Lock()
@@ -1258,6 +1259,11 @@ class WebRTCCameraPipeline:
         # Create conversion and appsink pipeline
         videoconvert = Gst.ElementFactory.make("videoconvert", f"convert-{self.camera_id}")
         videoscale = Gst.ElementFactory.make("videoscale", f"scale-{self.camera_id}")
+        
+        # Use Lanczos scaling (method=4) for highest quality
+        # Methods: 0=nearest, 1=bilinear, 2=4-tap, 3=9-tap, 4=Lanczos
+        videoscale.set_property("method", 4)
+        
         capsfilter = Gst.ElementFactory.make("capsfilter", f"caps-{self.camera_id}")
         appsink = Gst.ElementFactory.make("appsink", f"sink-{self.camera_id}")
         
@@ -1283,6 +1289,65 @@ class WebRTCCameraPipeline:
         self.pipeline.add(capsfilter)
         self.pipeline.add(appsink)
         
+        # If saving raw camera input, add a tee after videoconvert to capture pre-scaling frames
+        if self.config.camera_input_dir:
+            tee = Gst.ElementFactory.make("tee", f"tee-{self.camera_id}")
+            queue_main = Gst.ElementFactory.make("queue", f"queue-main-{self.camera_id}")
+            queue_raw = Gst.ElementFactory.make("queue", f"queue-raw-{self.camera_id}")
+            raw_capsfilter = Gst.ElementFactory.make("capsfilter", f"raw-caps-{self.camera_id}")
+            raw_appsink = Gst.ElementFactory.make("appsink", f"raw-sink-{self.camera_id}")
+            
+            if not all([tee, queue_main, queue_raw, raw_capsfilter, raw_appsink]):
+                print(f"[WebRTC Camera {self.camera_id}] Failed to create raw capture elements, continuing without raw capture")
+            else:
+                # Configure raw capsfilter - just convert to RGB, no scaling
+                raw_capsfilter.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGB"))
+                
+                # Configure raw appsink
+                raw_appsink.set_property("emit-signals", True)
+                raw_appsink.set_property("max-buffers", 2)
+                raw_appsink.set_property("drop", True)
+                raw_appsink.connect("new-sample", self._on_raw_sample)
+                
+                # Add elements
+                self.pipeline.add(tee)
+                self.pipeline.add(queue_main)
+                self.pipeline.add(queue_raw)
+                self.pipeline.add(raw_capsfilter)
+                self.pipeline.add(raw_appsink)
+                
+                # Sync states for all elements
+                videoconvert.sync_state_with_parent()
+                tee.sync_state_with_parent()
+                queue_main.sync_state_with_parent()
+                queue_raw.sync_state_with_parent()
+                videoscale.sync_state_with_parent()
+                capsfilter.sync_state_with_parent()
+                appsink.sync_state_with_parent()
+                raw_capsfilter.sync_state_with_parent()
+                raw_appsink.sync_state_with_parent()
+                
+                # Link: decodebin -> videoconvert -> tee
+                #                                     ├-> queue_main -> videoscale -> capsfilter -> appsink (scaled)
+                #                                     └-> queue_raw -> raw_capsfilter -> raw_appsink (raw)
+                pad.link(videoconvert.get_static_pad("sink"))
+                videoconvert.link(tee)
+                
+                # Main branch (scaled)
+                tee.link(queue_main)
+                queue_main.link(videoscale)
+                videoscale.link(capsfilter)
+                capsfilter.link(appsink)
+                
+                # Raw branch (unscaled)
+                tee.link(queue_raw)
+                queue_raw.link(raw_capsfilter)
+                raw_capsfilter.link(raw_appsink)
+                
+                print(f"[WebRTC Camera {self.camera_id}] Video stream connected (with raw capture)")
+                return
+        
+        # Standard pipeline without raw capture
         # Sync states
         videoconvert.sync_state_with_parent()
         videoscale.sync_state_with_parent()
@@ -1333,6 +1398,50 @@ class WebRTCCameraPipeline:
             
             # Invoke callback
             self.frame_callback(self.camera_id, timestamp_ns, frame)
+            
+        finally:
+            buffer.unmap(map_info)
+        
+        return Gst.FlowReturn.OK
+    
+    def _on_raw_sample(self, appsink) -> Gst.FlowReturn:
+        """Handle raw video frame (before scaling) for debugging."""
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.ERROR
+        
+        # Get buffer
+        buffer = sample.get_buffer()
+        
+        # Extract frame data
+        caps = sample.get_caps()
+        struct = caps.get_structure(0)
+        width = struct.get_value("width")
+        height = struct.get_value("height")
+        
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.ERROR
+        
+        try:
+            # Convert to numpy array (RGB format)
+            frame = np.ndarray(
+                shape=(height, width, 3),
+                dtype=np.uint8,
+                buffer=map_info.data
+            ).copy()
+            
+            # Save raw frame immediately
+            self.raw_frame_count += 1
+            save_dir = Path(self.config.camera_input_dir) / "raw_webrtc"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            img = Image.fromarray(frame)
+            save_path = save_dir / f"cam{self.camera_id}_raw_{self.raw_frame_count:06d}_{width}x{height}.png"
+            img.save(save_path)
+            
+            if self.config.verbose and self.raw_frame_count <= 5:
+                print(f"[WebRTC Camera {self.camera_id}] Saved raw frame {self.raw_frame_count}: {width}x{height} -> {save_path}")
             
         finally:
             buffer.unmap(map_info)
