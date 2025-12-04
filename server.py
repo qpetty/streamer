@@ -985,18 +985,21 @@ class WebRTCCameraPipeline:
         self.websocket = None  # Will be set when client connects
         self.connected = False  # True when WebRTC connection is established
         self.lock = threading.Lock()
+        self.signaling_loop = None  # Event loop for signaling (set by signaling server)
         
     def start(self):
         """Initialize the WebRTC pipeline (waits for incoming connection)."""
         # Create pipeline with webrtcbin
         self.pipeline = Gst.Pipeline.new(f"webrtc-cam-{self.camera_id}")
+        if not self.pipeline:
+            raise RuntimeError(f"Failed to create pipeline for camera {self.camera_id}")
         
         # Create webrtcbin element
         self.webrtcbin = Gst.ElementFactory.make("webrtcbin", f"webrtcbin-{self.camera_id}")
         if not self.webrtcbin:
             raise RuntimeError("Failed to create webrtcbin element. Is gst-plugins-bad installed?")
         
-        # Configure webrtcbin
+        # Configure webrtcbin for receiving streams
         self.webrtcbin.set_property("bundle-policy", GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE)
         self.webrtcbin.set_property("stun-server", self.config.stun_server)
         
@@ -1007,14 +1010,26 @@ class WebRTCCameraPipeline:
         
         self.pipeline.add(self.webrtcbin)
         
-        # Set pipeline to READY state - it will go to PLAYING when we receive an offer
-        # Don't set to PLAYING yet since we're waiting for incoming WebRTC connection
-        ret = self.pipeline.set_state(Gst.State.READY)
+        # Set pipeline to PLAYING state immediately - webrtcbin needs to be playing
+        # to handle incoming offers and create answers
+        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        
         if ret == Gst.StateChangeReturn.FAILURE:
-            print(f"[WebRTC Camera {self.camera_id}] Warning: Failed to set pipeline to READY state")
+            print(f"[WebRTC Camera {self.camera_id}] ERROR: Failed to set pipeline to PLAYING state")
+            # Get the bus and check for error messages
+            bus = self.pipeline.get_bus()
+            if bus:
+                msg = bus.pop_filtered(Gst.MessageType.ERROR)
+                if msg:
+                    err, debug = msg.parse_error()
+                    print(f"[WebRTC Camera {self.camera_id}] GStreamer error: {err.message}")
+                    print(f"[WebRTC Camera {self.camera_id}] Debug info: {debug}")
+        elif ret == Gst.StateChangeReturn.ASYNC:
+            # Wait for state change to complete
+            self.pipeline.get_state(5 * Gst.SECOND)
         
         if self.config.verbose:
-            print(f"[WebRTC Camera {self.camera_id}] Pipeline initialized, waiting for client connection...")
+            print(f"[WebRTC Camera {self.camera_id}] Pipeline ready")
             
     def stop(self):
         """Stop the WebRTC pipeline."""
@@ -1029,33 +1044,32 @@ class WebRTCCameraPipeline:
             self.websocket = websocket
             if websocket is None:
                 self.connected = False
-                # Reset pipeline to READY state when client disconnects
-                if self.pipeline:
-                    self.pipeline.set_state(Gst.State.READY)
+                # Don't change pipeline state - it needs to stay PLAYING for new connections
     
     def handle_sdp_offer(self, sdp_text: str):
         """Handle incoming SDP offer from client."""
+        # Schedule on GLib main loop to ensure thread safety with GStreamer
+        GLib.idle_add(self._handle_sdp_offer_impl, sdp_text)
+    
+    def _handle_sdp_offer_impl(self, sdp_text: str):
+        """Implementation of SDP offer handling (runs on GLib main loop)."""
         if self.config.verbose:
             print(f"[WebRTC Camera {self.camera_id}] Received SDP offer")
         
         # Mark as connected (WebRTC negotiation started)
         self.connected = True
         
-        # Set pipeline to PLAYING state now that we have a connection
-        ret = self.pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            print(f"[WebRTC Camera {self.camera_id}] Warning: Failed to set pipeline to PLAYING state")
-        
         # Parse SDP
         res, sdp_msg = GstSdp.SDPMessage.new()
         if res != GstSdp.SDPResult.OK:
             print(f"[WebRTC Camera {self.camera_id}] Failed to create SDP message")
-            return
+            return False
         
         res = GstSdp.sdp_message_parse_buffer(sdp_text.encode(), sdp_msg)
         if res != GstSdp.SDPResult.OK:
             print(f"[WebRTC Camera {self.camera_id}] Failed to parse SDP offer")
-            return
+            return False
+        
         
         # Create offer object
         offer = GstWebRTC.WebRTCSessionDescription.new(
@@ -1065,20 +1079,22 @@ class WebRTCCameraPipeline:
         # Set remote description
         promise = Gst.Promise.new_with_change_func(self._on_offer_set, None)
         self.webrtcbin.emit("set-remote-description", offer, promise)
+        
+        return False  # Don't repeat
     
     def handle_ice_candidate(self, candidate: str, sdp_mline_index: int):
         """Handle incoming ICE candidate from client."""
-        if self.config.verbose:
-            print(f"[WebRTC Camera {self.camera_id}] Received ICE candidate")
+        # Schedule on GLib main loop to ensure thread safety with GStreamer
+        GLib.idle_add(self._handle_ice_candidate_impl, candidate, sdp_mline_index)
+    
+    def _handle_ice_candidate_impl(self, candidate: str, sdp_mline_index: int):
+        """Implementation of ICE candidate handling (runs on GLib main loop)."""
         self.webrtcbin.emit("add-ice-candidate", sdp_mline_index, candidate)
+        return False  # Don't repeat
     
     def _on_offer_set(self, promise, user_data):
         """Callback when remote description is set."""
         promise.wait()
-        reply = promise.get_reply()
-        
-        if self.config.verbose:
-            print(f"[WebRTC Camera {self.camera_id}] Remote description set, creating answer...")
         
         # Create answer
         promise = Gst.Promise.new_with_change_func(self._on_answer_created, None)
@@ -1087,30 +1103,35 @@ class WebRTCCameraPipeline:
     def _on_answer_created(self, promise, user_data):
         """Callback when answer is created."""
         promise.wait()
-        reply = promise.get_reply()
         
-        if reply is None:
+        state = promise.get_reply()
+        if state is None:
             print(f"[WebRTC Camera {self.camera_id}] Failed to create answer")
             return
         
-        answer = reply.get_value("answer")
+        answer = state.get_value("answer")
         if answer is None:
-            print(f"[WebRTC Camera {self.camera_id}] No answer in reply")
+            error = state.get_value("error")
+            if error:
+                print(f"[WebRTC Camera {self.camera_id}] Error creating answer: {error}")
             return
         
         # Set local description
-        promise = Gst.Promise.new_with_change_func(self._on_local_description_set, answer)
+        promise = Gst.Promise.new_with_change_func(self._on_local_description_set, None)
         self.webrtcbin.emit("set-local-description", answer, promise)
     
-    def _on_local_description_set(self, promise, answer):
+    def _on_local_description_set(self, promise, user_data):
         """Callback when local description is set."""
         promise.wait()
         
-        if self.config.verbose:
-            print(f"[WebRTC Camera {self.camera_id}] Local description set, sending answer...")
+        # Get the local description from webrtcbin
+        local_desc = self.webrtcbin.get_property("local-description")
+        if local_desc is None:
+            print(f"[WebRTC Camera {self.camera_id}] ERROR: No local description available")
+            return
         
         # Send answer to client via WebSocket
-        sdp_text = answer.sdp.as_text()
+        sdp_text = local_desc.sdp.as_text()
         self._send_signaling_message({
             "type": "answer",
             "sdp": sdp_text,
@@ -1118,13 +1139,10 @@ class WebRTCCameraPipeline:
     
     def _on_negotiation_needed(self, webrtcbin):
         """Called when negotiation is needed."""
-        if self.config.verbose:
-            print(f"[WebRTC Camera {self.camera_id}] Negotiation needed")
+        pass  # We receive offers from clients, not initiate them
     
     def _on_ice_candidate(self, webrtcbin, sdp_mline_index: int, candidate: str):
         """Called when we have a new ICE candidate to send to the peer."""
-        if self.config.verbose:
-            print(f"[WebRTC Camera {self.camera_id}] Sending ICE candidate")
         self._send_signaling_message({
             "type": "ice",
             "candidate": candidate,
@@ -1135,9 +1153,6 @@ class WebRTCCameraPipeline:
         """Called when a new pad is added (incoming stream)."""
         if pad.direction != Gst.PadDirection.SRC:
             return
-        
-        if self.config.verbose:
-            print(f"[WebRTC Camera {self.camera_id}] New incoming stream pad: {pad.get_name()}")
         
         # Get the pad caps to determine media type
         caps = pad.get_current_caps()
@@ -1151,9 +1166,6 @@ class WebRTCCameraPipeline:
         struct = caps.get_structure(0)
         media_type = struct.get_name()
         
-        if self.config.verbose:
-            print(f"[WebRTC Camera {self.camera_id}] Media type: {media_type}")
-        
         # Only handle video streams
         if not media_type.startswith("application/x-rtp"):
             return
@@ -1163,12 +1175,7 @@ class WebRTCCameraPipeline:
         media = struct.get_string("media")
         
         if media != "video":
-            if self.config.verbose:
-                print(f"[WebRTC Camera {self.camera_id}] Ignoring non-video stream: {media}")
             return
-        
-        if self.config.verbose:
-            print(f"[WebRTC Camera {self.camera_id}] Video encoding: {encoding_name}")
         
         # Create decoding pipeline for the incoming video
         self._setup_decoding_pipeline(pad, encoding_name)
@@ -1224,9 +1231,6 @@ class WebRTCCameraPipeline:
         if not name.startswith("video/"):
             return
         
-        if self.config.verbose:
-            print(f"[WebRTC Camera {self.camera_id}] Decoded video stream ready")
-        
         # Create conversion and appsink pipeline
         videoconvert = Gst.ElementFactory.make("videoconvert", f"convert-{self.camera_id}")
         videoscale = Gst.ElementFactory.make("videoscale", f"scale-{self.camera_id}")
@@ -1267,8 +1271,7 @@ class WebRTCCameraPipeline:
         videoscale.link(capsfilter)
         capsfilter.link(appsink)
         
-        if self.config.verbose:
-            print(f"[WebRTC Camera {self.camera_id}] Video pipeline connected")
+        print(f"[WebRTC Camera {self.camera_id}] Video stream connected")
     
     def _on_new_sample(self, appsink) -> Gst.FlowReturn:
         """Handle new decoded video frame."""
@@ -1319,11 +1322,15 @@ class WebRTCCameraPipeline:
                 print(f"[WebRTC Camera {self.camera_id}] No WebSocket connection for signaling")
                 return
             
-            # Schedule send on the event loop
+            if self.signaling_loop is None:
+                print(f"[WebRTC Camera {self.camera_id}] No signaling event loop available")
+                return
+            
+            # Schedule send on the signaling event loop
             try:
                 asyncio.run_coroutine_threadsafe(
                     self.websocket.send(json.dumps(message)),
-                    asyncio.get_event_loop()
+                    self.signaling_loop
                 )
             except Exception as e:
                 print(f"[WebRTC Camera {self.camera_id}] Failed to send signaling message: {e}")
@@ -1408,7 +1415,6 @@ class WebRTCSignalingServer:
             ssl_context.load_cert_chain(self.config.ssl_cert, self.config.ssl_key)
             protocol = "wss"
         
-        print(f"[WebRTC Signaling] Starting server on {protocol}://{host}:{port}")
         
         self.server = await serve(
             self._handle_client,
@@ -1420,7 +1426,6 @@ class WebRTCSignalingServer:
         )
         
         print(f"[WebRTC Signaling] Server ready at {protocol}://{host}:{port}")
-        print(f"[WebRTC Signaling] Clients should connect and send: {{\"type\": \"register\", \"camera_id\": 0}}")
     
     async def _handle_client(self, websocket, path=None):
         """Handle a WebSocket client connection."""
@@ -1449,9 +1454,9 @@ class WebRTCSignalingServer:
                         
                         pipeline = self.camera_pipelines[camera_id]
                         pipeline.set_websocket(websocket)
+                        pipeline.signaling_loop = self.loop  # Give pipeline access to our event loop
                         
-                        if self.config.verbose:
-                            print(f"[WebRTC Signaling] Client registered for camera {camera_id}")
+                        print(f"[WebRTC] Camera {camera_id} client connected")
                         
                         await websocket.send(json.dumps({
                             "type": "registered",
@@ -1494,12 +1499,11 @@ class WebRTCSignalingServer:
         
         except Exception as e:
             if self.config.verbose:
-                print(f"[WebRTC Signaling] Client disconnected: {e}")
+                print(f"[WebRTC] Client disconnected: {e}")
         finally:
             if pipeline:
                 pipeline.set_websocket(None)
-            if self.config.verbose:
-                print(f"[WebRTC Signaling] Client for camera {camera_id} disconnected")
+                print(f"[WebRTC] Camera {camera_id} client disconnected")
 
 
 class WebClientServer:
