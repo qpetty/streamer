@@ -51,6 +51,9 @@ Usage:
     # RTSP streams:
     python server.py --mode rtsp --rtsp0 rtsp://... --rtsp1 rtsp://...
     
+    # RTMP streams:
+    python server.py --mode rtmp --rtmp0 rtmp://server/live/stream1 --rtmp1 rtmp://server/live/stream2
+    
     # WebRTC mode (receive streams from browsers/mobile apps):
     python server.py --mode webrtc --webrtc-port 8080
     
@@ -426,6 +429,12 @@ class FrameSynchronizer:
                 key = timestamp_ns
                 
             self.buffers[camera_id][key] = (timestamp_ns, frame)
+            
+            # Debug: Log buffer status periodically
+            total_in_buffers = sum(len(self.buffers[i]) for i in range(self.num_cameras))
+            if total_in_buffers == 1 or total_in_buffers % 10 == 0:
+                buffer_sizes = [len(self.buffers[i]) for i in range(self.num_cameras)]
+                print(f"[Sync] Camera {camera_id} added frame. Buffer sizes: {buffer_sizes}")
             
             # Try to find a matching pair
             result = self._try_match()
@@ -912,6 +921,14 @@ class CameraPipeline:
         
         self.pipeline = Gst.parse_launch(pipeline_str)
         
+        # Connect bus to catch errors and state changes
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self._on_bus_error)
+        bus.connect("message::warning", self._on_bus_warning)
+        bus.connect("message::state-changed", self._on_state_changed)
+        bus.connect("message::eos", self._on_eos)
+        
         # Connect appsink signal
         appsink = self.pipeline.get_by_name("sink")
         appsink.connect("new-sample", self._on_new_sample)
@@ -923,6 +940,29 @@ class CameraPipeline:
         
         if self.config.verbose:
             print(f"[Camera {self.camera_id}] Started")
+    
+    def _on_bus_error(self, bus, message):
+        """Handle GStreamer error messages."""
+        err, debug = message.parse_error()
+        print(f"[Camera {self.camera_id}] ERROR: {err.message}")
+        if debug:
+            print(f"[Camera {self.camera_id}] Debug: {debug}")
+    
+    def _on_bus_warning(self, bus, message):
+        """Handle GStreamer warning messages."""
+        warn, debug = message.parse_warning()
+        print(f"[Camera {self.camera_id}] WARNING: {warn.message}")
+    
+    def _on_state_changed(self, bus, message):
+        """Handle pipeline state changes."""
+        if message.src == self.pipeline:
+            old, new, pending = message.parse_state_changed()
+            if self.config.verbose:
+                print(f"[Camera {self.camera_id}] State: {old.value_nick} -> {new.value_nick}")
+    
+    def _on_eos(self, bus, message):
+        """Handle end of stream."""
+        print(f"[Camera {self.camera_id}] End of stream")
             
     def stop(self):
         """Stop the camera pipeline."""
@@ -939,6 +979,11 @@ class CameraPipeline:
         
         # Apply frame skip
         self.frame_count += 1
+        
+        # Debug: Log frame arrival (every 30 frames to avoid spam)
+        if self.frame_count == 1 or self.frame_count % 30 == 0:
+            print(f"[Camera {self.camera_id}] Received frame {self.frame_count}")
+        
         if self.config.frame_skip > 1:
             if (self.frame_count - 1) % self.config.frame_skip != 0:
                 return Gst.FlowReturn.OK
@@ -2644,6 +2689,33 @@ def create_rtsp_config(url_0: str, url_1: str) -> ServerConfig:
     )
 
 
+def create_rtmp_config(url_0: str, url_1: str) -> ServerConfig:
+    """
+    Create a configuration for RTMP streams.
+    
+    Uses decodebin for automatic codec detection and dynamic pad handling,
+    which is required for FLV container demuxing.
+    
+    Uses frame-count-based sync since RTMP streams from different devices
+    have unsynchronized timestamps.
+    
+    Args:
+        url_0: RTMP URL for camera 0 (e.g., rtmp://server/live/stream1)
+        url_1: RTMP URL for camera 1 (e.g., rtmp://server/live/stream2)
+    """
+    return ServerConfig(
+        camera_0_source=f"rtmpsrc location={url_0} ! decodebin ! videoconvert",
+        camera_1_source=f"rtmpsrc location={url_1} ! decodebin ! videoconvert",
+        input_width=1920,
+        input_height=1080,
+        input_framerate=30,
+        frame_skip=2,
+        max_fps=15.0,
+        use_frame_count_sync=True,  # Use frame count sync since RTMP devices have different clocks
+        verbose=True,
+    )
+
+
 def create_webrtc_config(
     port: int = 8080,
     stun_server: str = "stun://stun.l.google.com:19302",
@@ -2765,6 +2837,9 @@ Examples:
   # RTSP streams:
   python server.py --mode rtsp --rtsp0 rtsp://cam1/stream --rtsp1 rtsp://cam2/stream
   
+  # RTMP streams:
+  python server.py --mode rtmp --rtmp0 rtmp://server/live/cam1 --rtmp1 rtmp://server/live/cam2
+  
   # WebRTC mode - receive streams from browsers/mobile apps:
   python server.py --mode webrtc --webrtc-port 8080
   
@@ -2780,7 +2855,7 @@ Examples:
     )
     parser.add_argument(
         "--mode",
-        choices=["test", "file", "v4l2", "rtsp", "webrtc", "custom"],
+        choices=["test", "file", "v4l2", "rtsp", "rtmp", "webrtc", "custom"],
         default="file",
         help="Camera mode (default: file)"
     )
@@ -2806,6 +2881,14 @@ Examples:
     parser.add_argument(
         "--rtsp1",
         help="RTSP URL for camera 1"
+    )
+    parser.add_argument(
+        "--rtmp0",
+        help="RTMP URL for camera 0 (e.g., rtmp://server/live/stream1)"
+    )
+    parser.add_argument(
+        "--rtmp1",
+        help="RTMP URL for camera 1 (e.g., rtmp://server/live/stream2)"
     )
     parser.add_argument(
         "--frame-skip",
@@ -3090,6 +3173,10 @@ Examples:
         if not args.rtsp0 or not args.rtsp1:
             parser.error("RTSP mode requires --rtsp0 and --rtsp1 URLs")
         config = create_rtsp_config(args.rtsp0, args.rtsp1)
+    elif args.mode == "rtmp":
+        if not args.rtmp0 or not args.rtmp1:
+            parser.error("RTMP mode requires --rtmp0 and --rtmp1 URLs")
+        config = create_rtmp_config(args.rtmp0, args.rtmp1)
     else:
         config = ServerConfig()
     
