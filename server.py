@@ -518,7 +518,10 @@ class GPUWorker:
         self.config = config
         self.encoder: Optional[DepthSplatInference] = None
         self.depth_anything: Optional[DepthAnything3] = None
-        self.task_queue = queue.Queue()
+        # Latest task buffer (always process newest task for lowest latency)
+        self.latest_task: Optional[tuple] = None
+        self.latest_task_lock = threading.Lock()
+        self.latest_task_event = threading.Event()
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.ready_event = threading.Event()  # Signals when models are loaded
@@ -541,13 +544,24 @@ class GPUWorker:
     def stop(self):
         """Stop the worker thread."""
         self.running = False
-        self.task_queue.put(None)  # Poison pill
+        self.latest_task_event.set()  # Wake up the thread so it can exit
         if self.thread:
             self.thread.join(timeout=5.0)
             
     def submit(self, task: tuple):
-        """Submit a task to this worker."""
-        self.task_queue.put(task)
+        """Submit a task to this worker (overwrites any pending task)."""
+        seq_id = task[0]
+        with self.latest_task_lock:
+            old_task = self.latest_task
+            self.latest_task = task
+            if old_task is not None:
+                old_seq_id = old_task[0]
+                # Call cancel callback for the replaced task
+                if len(old_task) > 3 and old_task[3] is not None:
+                    old_task[3](old_seq_id)  # cancel_callback(old_seq_id)
+                if self.config.verbose:
+                    print(f"[Worker {self.gpu_id}:{self.worker_id}] Task {seq_id} replaced pending task {old_seq_id}")
+        self.latest_task_event.set()
         
     def _run(self):
         """Worker thread main loop."""
@@ -577,15 +591,23 @@ class GPUWorker:
         
         while self.running:
             try:
-                task = self.task_queue.get(timeout=1.0)
-                if task is None:  # Poison pill
-                    break
+                # Wait for a task to be available
+                if not self.latest_task_event.wait(timeout=1.0):
+                    continue  # Timeout, check if still running
+                
+                # Grab the latest task atomically
+                with self.latest_task_lock:
+                    if self.latest_task is None:
+                        self.latest_task_event.clear()
+                        continue
                     
-                seq_id, frames_dict, result_callback = task
+                    task = self.latest_task
+                    self.latest_task = None
+                    self.latest_task_event.clear()
+                
+                seq_id, frames_dict, result_callback, _cancel_callback = task
                 self._process_task(seq_id, frames_dict, result_callback)
                 
-            except queue.Empty:
-                continue
             except Exception as e:
                 print(f"[Worker {self.gpu_id}:{self.worker_id}] Error: {e}")
                 
@@ -773,13 +795,13 @@ class GPUWorkerPool:
             worker.stop()
         print("Worker pool stopped")
         
-    def submit(self, seq_id: int, frames_dict: dict, result_callback: Callable):
+    def submit(self, seq_id: int, frames_dict: dict, result_callback: Callable, cancel_callback: Callable = None):
         """Submit a task to the next available worker (round-robin)."""
         with self.lock:
             worker = self.workers[self.worker_index]
             self.worker_index = (self.worker_index + 1) % len(self.workers)
         
-        worker.submit((seq_id, frames_dict, result_callback))
+        worker.submit((seq_id, frames_dict, result_callback, cancel_callback))
 
 
 # ============================================================================
@@ -788,10 +810,11 @@ class GPUWorkerPool:
 
 class OutputSequencer:
     """
-    Ensures PLY outputs are emitted in correct sequential order.
+    Emits PLY outputs in submission order.
     
-    Buffers out-of-order results and releases them when all preceding
-    sequences have been received.
+    Tracks which seq_ids are in-flight (submitted to workers) and emits
+    results in the order they were submitted. This ensures correct ordering
+    with multiple GPUs while still allowing frame skipping.
     """
     
     def __init__(
@@ -809,8 +832,6 @@ class OutputSequencer:
             save_files: Whether to save files to disk (can be False for streaming-only)
         """
         self.config = config
-        self.buffer: dict[int, bytes] = {}
-        self.next_seq_to_emit = 0
         self.total_emitted = 0
         self.lock = threading.Lock()
         self.save_files = save_files
@@ -819,44 +840,77 @@ class OutputSequencer:
             self.output_dir.mkdir(parents=True, exist_ok=True)
         self.on_complete = on_complete  # Callback when a PLY is emitted
         
+        # Track in-flight seq_ids in submission order
+        self.in_flight: list[int] = []  # Ordered list of seq_ids submitted to workers
+        self.results_buffer: dict[int, bytes] = {}  # Buffer for completed but not-yet-emitted results
+        
+    def mark_submitted(self, seq_id: int):
+        """
+        Mark a seq_id as submitted to a worker.
+        Must be called before add_result for correct ordering.
+        """
+        with self.lock:
+            self.in_flight.append(seq_id)
+            if self.config.verbose:
+                print(f"[Sequencer] Submitted seq {seq_id}, in-flight count: {len(self.in_flight)}")
+    
+    def cancel_submitted(self, seq_id: int):
+        """
+        Remove a seq_id from in-flight when it's replaced/cancelled.
+        Called by workers when a pending task is replaced by a newer one.
+        """
+        with self.lock:
+            if seq_id in self.in_flight:
+                self.in_flight.remove(seq_id)
+                if self.config.verbose:
+                    print(f"[Sequencer] Cancelled seq {seq_id}, in-flight count: {len(self.in_flight)}")
+        
     def add_result(self, seq_id: int, output_bytes: bytes):
         """
-        Add a result and emit any ready sequences.
+        Add a result and emit if it's the next in submission order.
         
         Args:
             seq_id: Sequence ID of the result
             output_bytes: Output file contents (SPZ or PLY)
         """
         with self.lock:
-            self.buffer[seq_id] = output_bytes
+            # Buffer this result
+            self.results_buffer[seq_id] = output_bytes
+            
+            # Emit all results that are ready (in submission order)
             self._emit_ready()
             
     def _emit_ready(self):
-        """Emit all ready sequences in order."""
-        while self.next_seq_to_emit in self.buffer:
-            seq_id = self.next_seq_to_emit
-            output_bytes = self.buffer.pop(seq_id)
+        """Emit results that are ready in submission order."""
+        while self.in_flight and self.in_flight[0] in self.results_buffer:
+            seq_id = self.in_flight.pop(0)
+            output_bytes = self.results_buffer.pop(seq_id)
+            
+            size_mb = len(output_bytes) / (1024 * 1024)
             
             # Emit via callback (e.g., WebSocket streaming)
             if self.config.output_callback:
                 try:
                     self.config.output_callback(seq_id, output_bytes)
+                    if self.config.verbose:
+                        print(f"[Output] Sent seq {seq_id} via callback ({size_mb:.2f} MB)")
                 except Exception as e:
                     print(f"Output callback error for seq {seq_id}: {e}")
             
             # Save to file if enabled
             if self.save_files:
                 ext = self.config.output_format.lower()
-                output_path = self.output_dir / f"output_{seq_id:06d}.{ext}"
+                output_path = self.output_dir / f"output_{self.total_emitted:06d}.{ext}"
                 with open(output_path, 'wb') as f:
                     f.write(output_bytes)
                 
                 if self.config.verbose:
-                    size_mb = len(output_bytes) / (1024 * 1024)
                     print(f"[Output] Saved seq {seq_id} to {output_path} ({size_mb:.2f} MB)")
             
-            self.next_seq_to_emit += 1
             self.total_emitted += 1
+            
+            if self.config.verbose:
+                print(f"[Output] Emitted seq {seq_id}, total emitted: {self.total_emitted}")
             
             # Notify completion callback
             if self.on_complete:
@@ -1835,8 +1889,10 @@ class WebRTCDepthSplatServer:
         self.last_process_time = 0.0
         self.min_frame_interval = 1.0 / self.config.max_fps if self.config.max_fps > 0 else 0.0
         
-        # Processing queue
-        self.process_queue = queue.Queue(maxsize=self.config.max_queue_size)
+        # Latest frame buffer (always process newest frame for lowest latency)
+        self.latest_frame: Optional[tuple] = None  # Holds (seq_id, frames_dict) or None
+        self.latest_frame_lock = threading.Lock()
+        self.latest_frame_event = threading.Event()  # Signals when new frame available
         self.process_thread: Optional[threading.Thread] = None
         
         # Counters
@@ -2009,7 +2065,7 @@ class WebRTCDepthSplatServer:
         
         # Stop process thread
         if self.process_thread:
-            self.process_queue.put(None)
+            self.latest_frame_event.set()  # Wake up the thread so it can exit
             self.process_thread.join(timeout=5.0)
         
         print("WebRTC server stopped")
@@ -2041,36 +2097,46 @@ class WebRTCDepthSplatServer:
                 proc_seq_id = self.processing_seq_counter
                 self.processing_seq_counter += 1
             
-            # Queue for processing
-            try:
-                self.process_queue.put_nowait((proc_seq_id, frames_dict))
+            # Store as latest frame (overwrites any previous unprocessed frame)
+            with self.latest_frame_lock:
+                old_frame = self.latest_frame
+                self.latest_frame = (proc_seq_id, frames_dict)
                 self.frame_pairs_queued += 1
                 
                 if self.config.verbose:
-                    print(f"[Queue] Frame pair {proc_seq_id} queued (sync_seq={sync_seq_id})")
-                
-            except queue.Full:
-                if self.config.verbose:
-                    print(f"[Queue] Dropping frame pair (queue full)")
+                    if old_frame is not None:
+                        print(f"[Latest] Frame pair {proc_seq_id} replaced {old_frame[0]} (sync_seq={sync_seq_id})")
+                    else:
+                        print(f"[Latest] Frame pair {proc_seq_id} ready (sync_seq={sync_seq_id})")
+            
+            # Signal that a new frame is available
+            self.latest_frame_event.set()
     
     def _process_loop(self):
-        """Process queued frame pairs."""
+        """Process the latest frame pair when available."""
         while self.running:
-            try:
-                item = self.process_queue.get(timeout=1.0)
-                if item is None:
-                    break
-                
-                seq_id, frames_dict = item
-                
-                self.worker_pool.submit(
-                    seq_id,
-                    frames_dict,
-                    self.output_sequencer.add_result
-                )
-                
-            except queue.Empty:
-                continue
+            # Wait for a new frame to be available
+            if not self.latest_frame_event.wait(timeout=1.0):
+                continue  # Timeout, check if still running
+            
+            # Grab the latest frame atomically
+            with self.latest_frame_lock:
+                if self.latest_frame is None:
+                    self.latest_frame_event.clear()
+                    continue
+                    
+                seq_id, frames_dict = self.latest_frame
+                self.latest_frame = None  # Clear it
+                self.latest_frame_event.clear()
+            
+            # Mark as submitted for correct output ordering, then submit to worker
+            self.output_sequencer.mark_submitted(seq_id)
+            self.worker_pool.submit(
+                seq_id,
+                frames_dict,
+                self.output_sequencer.add_result,
+                self.output_sequencer.cancel_submitted
+            )
 
 
 # ============================================================================
@@ -2104,8 +2170,10 @@ class DepthSplatServer:
         self.last_process_time = 0.0
         self.min_frame_interval = 1.0 / self.config.max_fps if self.config.max_fps > 0 else 0.0
         
-        # Processing queue (with size limit)
-        self.process_queue = queue.Queue(maxsize=self.config.max_queue_size)
+        # Latest frame buffer (always process newest frame for lowest latency)
+        self.latest_frame: Optional[tuple] = None  # Holds (seq_id, frames_dict) or None
+        self.latest_frame_lock = threading.Lock()
+        self.latest_frame_event = threading.Event()  # Signals when new frame available
         self.process_thread: Optional[threading.Thread] = None
         
         # Counters and timing
@@ -2243,7 +2311,7 @@ class DepthSplatServer:
         
         # Wait for process thread
         if self.process_thread:
-            self.process_queue.put(None)  # Poison pill
+            self.latest_frame_event.set()  # Wake up the thread so it can exit
             self.process_thread.join(timeout=5.0)
         
         print("Server stopped")
@@ -2278,45 +2346,54 @@ class DepthSplatServer:
                 proc_seq_id = self.processing_seq_counter
                 self.processing_seq_counter += 1
             
-            # Queue for processing with the sequential processing ID
-            try:
-                self.process_queue.put_nowait((proc_seq_id, frames_dict))
+            # Store as latest frame (overwrites any previous unprocessed frame)
+            with self.latest_frame_lock:
+                old_frame = self.latest_frame
+                self.latest_frame = (proc_seq_id, frames_dict)
                 self.frame_pairs_queued += 1
                 
                 if self.config.verbose:
-                    print(f"[Queue] Frame pair {proc_seq_id} queued (sync_seq={sync_seq_id})")
-                
-                # Check if we've reached the max and should stop accepting new frames
-                if self.config.max_frame_pairs > 0 and self.frame_pairs_queued >= self.config.max_frame_pairs:
-                    print(f"[Limit] Queued {self.config.max_frame_pairs} frame pairs, waiting for processing...")
-                    
-            except queue.Full:
-                if self.config.verbose:
-                    print(f"[Queue] Dropping frame pair (queue full)")
+                    if old_frame is not None:
+                        print(f"[Latest] Frame pair {proc_seq_id} replaced {old_frame[0]} (sync_seq={sync_seq_id})")
+                    else:
+                        print(f"[Latest] Frame pair {proc_seq_id} ready (sync_seq={sync_seq_id})")
+            
+            # Signal that a new frame is available
+            self.latest_frame_event.set()
+            
+            # Check if we've reached the max and should stop accepting new frames
+            if self.config.max_frame_pairs > 0 and self.frame_pairs_queued >= self.config.max_frame_pairs:
+                print(f"[Limit] Queued {self.config.max_frame_pairs} frame pairs, waiting for processing...")
                     
     def _process_loop(self):
-        """Process queued frame pairs."""
+        """Process the latest frame pair when available."""
         while self.running:
-            try:
-                item = self.process_queue.get(timeout=1.0)
-                if item is None:  # Poison pill
-                    break
+            # Wait for a new frame to be available
+            if not self.latest_frame_event.wait(timeout=1.0):
+                continue  # Timeout, check if still running
+            
+            # Grab the latest frame atomically
+            with self.latest_frame_lock:
+                if self.latest_frame is None:
+                    self.latest_frame_event.clear()
+                    continue
                     
-                seq_id, frames_dict = item
-                
-                # Save input frames if debugging
-                if self.config.save_input_frames:
-                    self._save_debug_frames(seq_id, frames_dict)
-                
-                # Submit to worker pool
-                self.worker_pool.submit(
-                    seq_id,
-                    frames_dict,
-                    self.output_sequencer.add_result
-                )
-                
-            except queue.Empty:
-                continue
+                seq_id, frames_dict = self.latest_frame
+                self.latest_frame = None  # Clear it
+                self.latest_frame_event.clear()
+            
+            # Save input frames if debugging
+            if self.config.save_input_frames:
+                self._save_debug_frames(seq_id, frames_dict)
+            
+            # Mark as submitted for correct output ordering, then submit to worker
+            self.output_sequencer.mark_submitted(seq_id)
+            self.worker_pool.submit(
+                seq_id,
+                frames_dict,
+                self.output_sequencer.add_result,
+                self.output_sequencer.cancel_submitted
+            )
                 
     def _save_debug_frames(self, seq_id: int, frames_dict: dict):
         """Save input frames for debugging."""
