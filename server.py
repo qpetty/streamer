@@ -51,6 +51,9 @@ Usage:
     # RTSP streams:
     python server.py --mode rtsp --rtsp0 rtsp://... --rtsp1 rtsp://...
     
+    # WebRTC mode (receive streams from browsers/mobile apps):
+    python server.py --mode webrtc --webrtc-port 8080
+    
     # Custom (edit CONFIG in this file):
     python server.py --mode custom
 
@@ -61,7 +64,30 @@ Throttling/Skipping:
     --frame-skip N    Process every Nth frame (default: 1 = all frames)
     --max-fps F       Maximum processing rate in FPS (default: unlimited)
 
-WebSocket Streaming:
+WebRTC Input Mode:
+    Receive camera streams from browsers or mobile apps via WebRTC:
+    
+    # Start server in WebRTC mode
+    python server.py --mode webrtc --webrtc-port 8080
+    
+    The server provides:
+    - HTTP server for signaling at http://server_ip:8080
+    - WebSocket signaling endpoint at ws://server_ip:8080/ws
+    - Optional STUN server configuration via --stun-server
+    
+    Clients should:
+    1. Connect to the WebSocket signaling endpoint
+    2. Send JSON: {"type": "register", "camera_id": 0}  (or 1 for second camera)
+    3. Exchange SDP offers/answers and ICE candidates
+    4. Stream video via WebRTC (H.264/VP8/VP9 supported)
+    
+    Message format (JSON):
+    - Register: {"type": "register", "camera_id": 0}
+    - SDP Offer: {"type": "offer", "sdp": "..."}
+    - SDP Answer: {"type": "answer", "sdp": "..."} (from server)
+    - ICE Candidate: {"type": "ice", "candidate": "...", "sdpMLineIndex": N}
+
+WebSocket Output Streaming:
     Enable with --websocket flag to stream outputs to remote clients:
     
     # File mode with WebSocket streaming (stream + save files)
@@ -85,17 +111,23 @@ WebSocket Streaming:
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstApp', '1.0')
-from gi.repository import Gst, GstApp, GLib
+gi.require_version('GstWebRTC', '1.0')
+gi.require_version('GstSdp', '1.0')
+from gi.repository import Gst, GstApp, GLib, GstWebRTC, GstSdp
 
 import sys
 import threading
 import queue
 import time
+import asyncio
+import json
+import ssl
+import subprocess
 import numpy as np
 import torch
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict, Any
 from collections import OrderedDict
 import io
 
@@ -231,6 +263,23 @@ class ServerConfig:
     
     # Processing resolution for DepthAnything3 (504 is default)
     depth_anything_process_res: int = 504
+    
+    # --- WebRTC Settings ---
+    # Port for WebRTC signaling server (HTTP + WebSocket)
+    webrtc_port: int = 8080
+    
+    # Port for serving the WebRTC client HTML page
+    web_client_port: int = 8888
+    
+    # STUN server for ICE (empty = use Google's public server)
+    stun_server: str = "stun://stun.l.google.com:19302"
+    
+    # --- SSL/TLS Settings ---
+    # Path to SSL certificate file (enables HTTPS/WSS when set)
+    ssl_cert: Optional[str] = None
+    
+    # Path to SSL private key file
+    ssl_key: Optional[str] = None
     
     # --- File-based Test Mode ---
     # When set, load images from this directory instead of cameras
@@ -902,6 +951,945 @@ class CameraPipeline:
 
 
 # ============================================================================
+# WebRTC Camera Pipeline
+# ============================================================================
+
+class WebRTCCameraPipeline:
+    """
+    WebRTC-based camera pipeline for receiving streams from browsers/mobile apps.
+    
+    Uses GStreamer's webrtcbin element to handle WebRTC connections.
+    Each instance handles one camera stream (camera_id 0 or 1).
+    """
+    
+    def __init__(
+        self,
+        camera_id: int,
+        config: ServerConfig,
+        frame_callback: Callable[[int, int, np.ndarray], None],
+    ):
+        """
+        Initialize WebRTC camera pipeline.
+        
+        Args:
+            camera_id: Camera index (0 or 1)
+            config: Server configuration
+            frame_callback: Callback for received frames (camera_id, timestamp_ns, frame)
+        """
+        self.camera_id = camera_id
+        self.config = config
+        self.frame_callback = frame_callback
+        self.pipeline: Optional[Gst.Pipeline] = None
+        self.webrtcbin: Optional[Gst.Element] = None
+        self.frame_count = 0
+        self.websocket = None  # Will be set when client connects
+        self.connected = False  # True when WebRTC connection is established
+        self.lock = threading.Lock()
+        
+    def start(self):
+        """Initialize the WebRTC pipeline (waits for incoming connection)."""
+        # Create pipeline with webrtcbin
+        self.pipeline = Gst.Pipeline.new(f"webrtc-cam-{self.camera_id}")
+        
+        # Create webrtcbin element
+        self.webrtcbin = Gst.ElementFactory.make("webrtcbin", f"webrtcbin-{self.camera_id}")
+        if not self.webrtcbin:
+            raise RuntimeError("Failed to create webrtcbin element. Is gst-plugins-bad installed?")
+        
+        # Configure webrtcbin
+        self.webrtcbin.set_property("bundle-policy", GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE)
+        self.webrtcbin.set_property("stun-server", self.config.stun_server)
+        
+        # Connect signals
+        self.webrtcbin.connect("on-negotiation-needed", self._on_negotiation_needed)
+        self.webrtcbin.connect("on-ice-candidate", self._on_ice_candidate)
+        self.webrtcbin.connect("pad-added", self._on_pad_added)
+        
+        self.pipeline.add(self.webrtcbin)
+        
+        # Set pipeline to READY state - it will go to PLAYING when we receive an offer
+        # Don't set to PLAYING yet since we're waiting for incoming WebRTC connection
+        ret = self.pipeline.set_state(Gst.State.READY)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            print(f"[WebRTC Camera {self.camera_id}] Warning: Failed to set pipeline to READY state")
+        
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] Pipeline initialized, waiting for client connection...")
+            
+    def stop(self):
+        """Stop the WebRTC pipeline."""
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            if self.config.verbose:
+                print(f"[WebRTC Camera {self.camera_id}] Stopped (received {self.frame_count} frames)")
+    
+    def set_websocket(self, websocket):
+        """Set the WebSocket connection for signaling."""
+        with self.lock:
+            self.websocket = websocket
+            if websocket is None:
+                self.connected = False
+                # Reset pipeline to READY state when client disconnects
+                if self.pipeline:
+                    self.pipeline.set_state(Gst.State.READY)
+    
+    def handle_sdp_offer(self, sdp_text: str):
+        """Handle incoming SDP offer from client."""
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] Received SDP offer")
+        
+        # Mark as connected (WebRTC negotiation started)
+        self.connected = True
+        
+        # Set pipeline to PLAYING state now that we have a connection
+        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            print(f"[WebRTC Camera {self.camera_id}] Warning: Failed to set pipeline to PLAYING state")
+        
+        # Parse SDP
+        res, sdp_msg = GstSdp.SDPMessage.new()
+        if res != GstSdp.SDPResult.OK:
+            print(f"[WebRTC Camera {self.camera_id}] Failed to create SDP message")
+            return
+        
+        res = GstSdp.sdp_message_parse_buffer(sdp_text.encode(), sdp_msg)
+        if res != GstSdp.SDPResult.OK:
+            print(f"[WebRTC Camera {self.camera_id}] Failed to parse SDP offer")
+            return
+        
+        # Create offer object
+        offer = GstWebRTC.WebRTCSessionDescription.new(
+            GstWebRTC.WebRTCSDPType.OFFER, sdp_msg
+        )
+        
+        # Set remote description
+        promise = Gst.Promise.new_with_change_func(self._on_offer_set, None)
+        self.webrtcbin.emit("set-remote-description", offer, promise)
+    
+    def handle_ice_candidate(self, candidate: str, sdp_mline_index: int):
+        """Handle incoming ICE candidate from client."""
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] Received ICE candidate")
+        self.webrtcbin.emit("add-ice-candidate", sdp_mline_index, candidate)
+    
+    def _on_offer_set(self, promise, user_data):
+        """Callback when remote description is set."""
+        promise.wait()
+        reply = promise.get_reply()
+        
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] Remote description set, creating answer...")
+        
+        # Create answer
+        promise = Gst.Promise.new_with_change_func(self._on_answer_created, None)
+        self.webrtcbin.emit("create-answer", None, promise)
+    
+    def _on_answer_created(self, promise, user_data):
+        """Callback when answer is created."""
+        promise.wait()
+        reply = promise.get_reply()
+        
+        if reply is None:
+            print(f"[WebRTC Camera {self.camera_id}] Failed to create answer")
+            return
+        
+        answer = reply.get_value("answer")
+        if answer is None:
+            print(f"[WebRTC Camera {self.camera_id}] No answer in reply")
+            return
+        
+        # Set local description
+        promise = Gst.Promise.new_with_change_func(self._on_local_description_set, answer)
+        self.webrtcbin.emit("set-local-description", answer, promise)
+    
+    def _on_local_description_set(self, promise, answer):
+        """Callback when local description is set."""
+        promise.wait()
+        
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] Local description set, sending answer...")
+        
+        # Send answer to client via WebSocket
+        sdp_text = answer.sdp.as_text()
+        self._send_signaling_message({
+            "type": "answer",
+            "sdp": sdp_text,
+        })
+    
+    def _on_negotiation_needed(self, webrtcbin):
+        """Called when negotiation is needed."""
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] Negotiation needed")
+    
+    def _on_ice_candidate(self, webrtcbin, sdp_mline_index: int, candidate: str):
+        """Called when we have a new ICE candidate to send to the peer."""
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] Sending ICE candidate")
+        self._send_signaling_message({
+            "type": "ice",
+            "candidate": candidate,
+            "sdpMLineIndex": sdp_mline_index,
+        })
+    
+    def _on_pad_added(self, webrtcbin, pad: Gst.Pad):
+        """Called when a new pad is added (incoming stream)."""
+        if pad.direction != Gst.PadDirection.SRC:
+            return
+        
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] New incoming stream pad: {pad.get_name()}")
+        
+        # Get the pad caps to determine media type
+        caps = pad.get_current_caps()
+        if caps is None:
+            caps = pad.query_caps(None)
+        
+        if caps is None or caps.is_empty():
+            print(f"[WebRTC Camera {self.camera_id}] No caps on pad")
+            return
+        
+        struct = caps.get_structure(0)
+        media_type = struct.get_name()
+        
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] Media type: {media_type}")
+        
+        # Only handle video streams
+        if not media_type.startswith("application/x-rtp"):
+            return
+        
+        # Check if it's video
+        encoding_name = struct.get_string("encoding-name")
+        media = struct.get_string("media")
+        
+        if media != "video":
+            if self.config.verbose:
+                print(f"[WebRTC Camera {self.camera_id}] Ignoring non-video stream: {media}")
+            return
+        
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] Video encoding: {encoding_name}")
+        
+        # Create decoding pipeline for the incoming video
+        self._setup_decoding_pipeline(pad, encoding_name)
+    
+    def _setup_decoding_pipeline(self, src_pad: Gst.Pad, encoding_name: str):
+        """Set up decoding pipeline for incoming video."""
+        # Use decodebin for automatic codec selection
+        decodebin = Gst.ElementFactory.make("decodebin", f"decode-{self.camera_id}")
+        if not decodebin:
+            print(f"[WebRTC Camera {self.camera_id}] Failed to create decodebin")
+            return
+        
+        decodebin.connect("pad-added", self._on_decodebin_pad)
+        
+        # Create appropriate depayloader based on encoding
+        depayloader = None
+        if encoding_name.upper() == "H264":
+            depayloader = Gst.ElementFactory.make("rtph264depay", f"depay-{self.camera_id}")
+        elif encoding_name.upper() == "VP8":
+            depayloader = Gst.ElementFactory.make("rtpvp8depay", f"depay-{self.camera_id}")
+        elif encoding_name.upper() == "VP9":
+            depayloader = Gst.ElementFactory.make("rtpvp9depay", f"depay-{self.camera_id}")
+        else:
+            # Try generic depayloader via decodebin
+            if self.config.verbose:
+                print(f"[WebRTC Camera {self.camera_id}] Unknown encoding {encoding_name}, using decodebin")
+        
+        if depayloader:
+            self.pipeline.add(depayloader)
+            self.pipeline.add(decodebin)
+            
+            depayloader.sync_state_with_parent()
+            decodebin.sync_state_with_parent()
+            
+            # Link: webrtcbin pad -> depayloader -> decodebin
+            src_pad.link(depayloader.get_static_pad("sink"))
+            depayloader.link(decodebin)
+        else:
+            # Direct to decodebin (it will handle depayloading)
+            self.pipeline.add(decodebin)
+            decodebin.sync_state_with_parent()
+            src_pad.link(decodebin.get_static_pad("sink"))
+    
+    def _on_decodebin_pad(self, decodebin, pad: Gst.Pad):
+        """Called when decodebin creates a new pad (decoded stream)."""
+        caps = pad.get_current_caps()
+        if caps is None:
+            return
+        
+        struct = caps.get_structure(0)
+        name = struct.get_name()
+        
+        if not name.startswith("video/"):
+            return
+        
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] Decoded video stream ready")
+        
+        # Create conversion and appsink pipeline
+        videoconvert = Gst.ElementFactory.make("videoconvert", f"convert-{self.camera_id}")
+        videoscale = Gst.ElementFactory.make("videoscale", f"scale-{self.camera_id}")
+        capsfilter = Gst.ElementFactory.make("capsfilter", f"caps-{self.camera_id}")
+        appsink = Gst.ElementFactory.make("appsink", f"sink-{self.camera_id}")
+        
+        if not all([videoconvert, videoscale, capsfilter, appsink]):
+            print(f"[WebRTC Camera {self.camera_id}] Failed to create conversion elements")
+            return
+        
+        # Configure capsfilter for RGB output at target resolution
+        width = self.config.input_width
+        height = self.config.input_height
+        out_caps = Gst.Caps.from_string(f"video/x-raw,format=RGB,width={width},height={height}")
+        capsfilter.set_property("caps", out_caps)
+        
+        # Configure appsink
+        appsink.set_property("emit-signals", True)
+        appsink.set_property("max-buffers", 2)
+        appsink.set_property("drop", True)
+        appsink.connect("new-sample", self._on_new_sample)
+        
+        # Add elements to pipeline
+        self.pipeline.add(videoconvert)
+        self.pipeline.add(videoscale)
+        self.pipeline.add(capsfilter)
+        self.pipeline.add(appsink)
+        
+        # Sync states
+        videoconvert.sync_state_with_parent()
+        videoscale.sync_state_with_parent()
+        capsfilter.sync_state_with_parent()
+        appsink.sync_state_with_parent()
+        
+        # Link: decodebin pad -> videoconvert -> videoscale -> capsfilter -> appsink
+        pad.link(videoconvert.get_static_pad("sink"))
+        videoconvert.link(videoscale)
+        videoscale.link(capsfilter)
+        capsfilter.link(appsink)
+        
+        if self.config.verbose:
+            print(f"[WebRTC Camera {self.camera_id}] Video pipeline connected")
+    
+    def _on_new_sample(self, appsink) -> Gst.FlowReturn:
+        """Handle new decoded video frame."""
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.ERROR
+        
+        # Apply frame skip
+        self.frame_count += 1
+        if self.config.frame_skip > 1:
+            if (self.frame_count - 1) % self.config.frame_skip != 0:
+                return Gst.FlowReturn.OK
+        
+        # Get buffer and timestamp
+        buffer = sample.get_buffer()
+        timestamp_ns = buffer.pts if buffer.pts != Gst.CLOCK_TIME_NONE else time.time_ns()
+        
+        # Extract frame data
+        caps = sample.get_caps()
+        struct = caps.get_structure(0)
+        width = struct.get_value("width")
+        height = struct.get_value("height")
+        
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.ERROR
+        
+        try:
+            # Convert to numpy array (RGB format)
+            frame = np.ndarray(
+                shape=(height, width, 3),
+                dtype=np.uint8,
+                buffer=map_info.data
+            ).copy()
+            
+            # Invoke callback
+            self.frame_callback(self.camera_id, timestamp_ns, frame)
+            
+        finally:
+            buffer.unmap(map_info)
+        
+        return Gst.FlowReturn.OK
+    
+    def _send_signaling_message(self, message: dict):
+        """Send a signaling message via WebSocket."""
+        with self.lock:
+            if self.websocket is None:
+                print(f"[WebRTC Camera {self.camera_id}] No WebSocket connection for signaling")
+                return
+            
+            # Schedule send on the event loop
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.websocket.send(json.dumps(message)),
+                    asyncio.get_event_loop()
+                )
+            except Exception as e:
+                print(f"[WebRTC Camera {self.camera_id}] Failed to send signaling message: {e}")
+
+
+class WebRTCSignalingServer:
+    """
+    WebSocket-based signaling server for WebRTC connections.
+    
+    Handles SDP offer/answer exchange and ICE candidate relay between
+    browser/mobile clients and the WebRTC camera pipelines.
+    """
+    
+    def __init__(
+        self,
+        config: ServerConfig,
+        camera_pipelines: Dict[int, WebRTCCameraPipeline],
+    ):
+        """
+        Initialize the signaling server.
+        
+        Args:
+            config: Server configuration
+            camera_pipelines: Dict mapping camera_id to WebRTCCameraPipeline
+        """
+        self.config = config
+        self.camera_pipelines = camera_pipelines
+        self.server = None
+        self.thread: Optional[threading.Thread] = None
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.running = False
+        
+    def start(self):
+        """Start the signaling server in a background thread."""
+        self.running = True
+        self.thread = threading.Thread(
+            target=self._run_server,
+            name="WebRTCSignaling",
+            daemon=True
+        )
+        self.thread.start()
+        
+        # Wait for server to start
+        time.sleep(1.0)
+        
+    def stop(self):
+        """Stop the signaling server."""
+        self.running = False
+        if self.loop:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        if self.thread:
+            self.thread.join(timeout=5.0)
+    
+    def _run_server(self):
+        """Run the async server in this thread."""
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
+        try:
+            self.loop.run_until_complete(self._start_server())
+            self.loop.run_forever()
+        finally:
+            self.loop.close()
+    
+    async def _start_server(self):
+        """Start the WebSocket server."""
+        try:
+            import websockets
+            from websockets.server import serve
+        except ImportError:
+            print("ERROR: websockets package not installed. Install with: pip install websockets")
+            return
+        
+        host = "0.0.0.0"
+        port = self.config.webrtc_port
+        
+        # Set up SSL context if certificates are provided
+        ssl_context = None
+        protocol = "ws"
+        if self.config.ssl_cert and self.config.ssl_key:
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.load_cert_chain(self.config.ssl_cert, self.config.ssl_key)
+            protocol = "wss"
+        
+        print(f"[WebRTC Signaling] Starting server on {protocol}://{host}:{port}")
+        
+        self.server = await serve(
+            self._handle_client,
+            host,
+            port,
+            ssl=ssl_context,
+            ping_interval=20,
+            ping_timeout=20,
+        )
+        
+        print(f"[WebRTC Signaling] Server ready at {protocol}://{host}:{port}")
+        print(f"[WebRTC Signaling] Clients should connect and send: {{\"type\": \"register\", \"camera_id\": 0}}")
+    
+    async def _handle_client(self, websocket, path=None):
+        """Handle a WebSocket client connection."""
+        camera_id = None
+        pipeline = None
+        
+        if self.config.verbose:
+            print(f"[WebRTC Signaling] Client connected from {websocket.remote_address}")
+        
+        try:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get("type")
+                    
+                    if msg_type == "register":
+                        # Client registers for a specific camera
+                        camera_id = data.get("camera_id", 0)
+                        
+                        if camera_id not in self.camera_pipelines:
+                            await websocket.send(json.dumps({
+                                "type": "error",
+                                "message": f"Invalid camera_id: {camera_id}. Valid: {list(self.camera_pipelines.keys())}"
+                            }))
+                            continue
+                        
+                        pipeline = self.camera_pipelines[camera_id]
+                        pipeline.set_websocket(websocket)
+                        
+                        if self.config.verbose:
+                            print(f"[WebRTC Signaling] Client registered for camera {camera_id}")
+                        
+                        await websocket.send(json.dumps({
+                            "type": "registered",
+                            "camera_id": camera_id,
+                        }))
+                    
+                    elif msg_type == "offer":
+                        # SDP offer from client
+                        if pipeline is None:
+                            await websocket.send(json.dumps({
+                                "type": "error",
+                                "message": "Must register before sending offer"
+                            }))
+                            continue
+                        
+                        sdp = data.get("sdp", "")
+                        pipeline.handle_sdp_offer(sdp)
+                    
+                    elif msg_type == "ice":
+                        # ICE candidate from client
+                        if pipeline is None:
+                            continue
+                        
+                        candidate = data.get("candidate", "")
+                        sdp_mline_index = data.get("sdpMLineIndex", 0)
+                        
+                        if candidate:  # Ignore empty candidates (end-of-candidates)
+                            pipeline.handle_ice_candidate(candidate, sdp_mline_index)
+                    
+                    else:
+                        if self.config.verbose:
+                            print(f"[WebRTC Signaling] Unknown message type: {msg_type}")
+                
+                except json.JSONDecodeError as e:
+                    print(f"[WebRTC Signaling] Invalid JSON: {e}")
+                except Exception as e:
+                    print(f"[WebRTC Signaling] Error handling message: {e}")
+                    import traceback
+                    traceback.print_exc()
+        
+        except Exception as e:
+            if self.config.verbose:
+                print(f"[WebRTC Signaling] Client disconnected: {e}")
+        finally:
+            if pipeline:
+                pipeline.set_websocket(None)
+            if self.config.verbose:
+                print(f"[WebRTC Signaling] Client for camera {camera_id} disconnected")
+
+
+class WebClientServer:
+    """
+    Simple HTTP server to serve the WebRTC client HTML page.
+    
+    This makes it easy to access the client from any device on the network.
+    Note: This serves over HTTP only. The WebSocket signaling server handles SSL separately.
+    
+    Supports RunPod environment variables for auto-configuration:
+    - RUNPOD_PUBLIC_IP: Pre-fills the server host field
+    - RUNPOD_TCP_PORT_8080: Pre-fills the signaling port field
+    """
+    
+    def __init__(self, port: int = 8888, verbose: bool = True, signaling_port: int = 8080):
+        """
+        Initialize the web client server.
+        
+        Args:
+            port: Port to serve on (default: 8888)
+            verbose: Enable verbose logging
+            signaling_port: WebRTC signaling port (for default value in HTML)
+        """
+        self.port = port
+        self.verbose = verbose
+        self.signaling_port = signaling_port
+        self.thread: Optional[threading.Thread] = None
+        self.server = None
+        self.running = False
+        
+        # Find the HTML file
+        self.html_file = Path(__file__).parent / "webrtc_client_example.html"
+        if not self.html_file.exists():
+            print(f"[WebClient] Warning: Client HTML not found at {self.html_file}")
+        
+        # Check for RunPod environment variables
+        import os
+        self.runpod_ip = os.environ.get("RUNPOD_PUBLIC_IP", "")
+        self.runpod_port = os.environ.get("RUNPOD_TCP_PORT_8080", "")
+    
+    def start(self):
+        """Start the HTTP server in a background thread."""
+        if not self.html_file.exists():
+            print(f"[WebClient] Cannot start - HTML file not found")
+            return
+        
+        self.running = True
+        self.thread = threading.Thread(
+            target=self._run_server,
+            name="WebClientServer",
+            daemon=True
+        )
+        self.thread.start()
+    
+    def stop(self):
+        """Stop the HTTP server."""
+        self.running = False
+        if self.server:
+            self.server.shutdown()
+        if self.thread:
+            self.thread.join(timeout=2.0)
+    
+    def _run_server(self):
+        """Run the HTTP server."""
+        import http.server
+        import socketserver
+        
+        html_dir = self.html_file.parent
+        html_name = self.html_file.name
+        runpod_ip = self.runpod_ip
+        runpod_port = self.runpod_port
+        signaling_port = self.signaling_port
+        verbose = self.verbose
+        
+        class CustomHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, directory=None, **kwargs):
+                super().__init__(*args, directory=str(html_dir), **kwargs)
+            
+            def log_message(self, format, *args):
+                # Suppress default logging unless verbose
+                pass
+            
+            def do_GET(self):
+                # Serve the HTML file for root path with templated values
+                if self.path == '/' or self.path == '/index.html' or self.path == '/' + html_name:
+                    self.send_response(200)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    
+                    # Read and template the HTML
+                    html_path = html_dir / html_name
+                    with open(html_path, 'r') as f:
+                        html_content = f.read()
+                    
+                    # Inject RunPod environment variables as JavaScript
+                    # This allows the client to use these values for auto-configuration
+                    inject_script = f'''<script>
+        // Auto-configuration from server environment
+        window.RUNPOD_PUBLIC_IP = "{runpod_ip}";
+        window.RUNPOD_TCP_PORT_8080 = "{runpod_port}";
+        window.DEFAULT_SIGNALING_PORT = "{signaling_port}";
+    </script>
+</head>'''
+                    html_content = html_content.replace('</head>', inject_script)
+                    
+                    self.wfile.write(html_content.encode('utf-8'))
+                    return
+                return super().do_GET()
+        
+        try:
+            server = socketserver.TCPServer(("0.0.0.0", self.port), CustomHandler)
+            self.server = server
+            if verbose:
+                print(f"[WebClient] Serving client at http://0.0.0.0:{self.port}")
+                if runpod_ip:
+                    print(f"[WebClient] RunPod IP detected: {runpod_ip}")
+                if runpod_port:
+                    print(f"[WebClient] RunPod port detected: {runpod_port}")
+            server.serve_forever()
+        except OSError as e:
+            print(f"[WebClient] Failed to start server on port {self.port}: {e}")
+        except Exception as e:
+            print(f"[WebClient] Server error: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+class WebRTCDepthSplatServer:
+    """
+    DepthSplat server using WebRTC for camera input.
+    
+    Similar to DepthSplatServer but uses WebRTC camera pipelines
+    instead of traditional GStreamer sources.
+    """
+    
+    def __init__(self, config: Optional[ServerConfig] = None):
+        self.config = config or CONFIG
+        self.synchronizer = FrameSynchronizer(
+            num_cameras=2,
+            use_frame_count_sync=True  # WebRTC streams use frame count sync
+        )
+        self.worker_pool: Optional[GPUWorkerPool] = None
+        self.output_sequencer: Optional[OutputSequencer] = None
+        self.cameras: Dict[int, WebRTCCameraPipeline] = {}
+        self.signaling_server: Optional[WebRTCSignalingServer] = None
+        self.web_client_server: Optional[WebClientServer] = None
+        self.main_loop: Optional[GLib.MainLoop] = None
+        self.running = False
+        
+        # Rate limiting
+        self.last_process_time = 0.0
+        self.min_frame_interval = 1.0 / self.config.max_fps if self.config.max_fps > 0 else 0.0
+        
+        # Processing queue
+        self.process_queue = queue.Queue(maxsize=self.config.max_queue_size)
+        self.process_thread: Optional[threading.Thread] = None
+        
+        # Counters
+        self.start_time: float = 0.0
+        self.frame_pairs_queued = 0
+        self.frame_pairs_processed = 0
+        self.processing_seq_counter = 0
+        self.seq_counter_lock = threading.Lock()
+    
+    def start(self):
+        """Start the WebRTC server."""
+        # Initialize GStreamer
+        Gst.init(None)
+        
+        print("="*70)
+        print("Starting DepthSplat WebRTC Server")
+        print("="*70)
+        print(f"WebRTC signaling port: {self.config.webrtc_port}")
+        print(f"STUN server: {self.config.stun_server}")
+        print(f"Input resolution: {self.config.input_width}x{self.config.input_height}")
+        print(f"Target resolution: {self.config.target_width}x{self.config.target_height}")
+        print(f"Frame skip: {self.config.frame_skip}")
+        print(f"Max FPS: {self.config.max_fps if self.config.max_fps > 0 else 'unlimited'}")
+        print("="*70)
+        
+        # Initialize output sequencer
+        def on_output_complete(total_emitted: int):
+            self.frame_pairs_processed = total_emitted
+            if self.config.max_frame_pairs > 0 and total_emitted >= self.config.max_frame_pairs:
+                print(f"\n[Complete] Processed {total_emitted} frame pairs")
+                self._request_stop()
+        
+        self.output_sequencer = OutputSequencer(
+            self.config,
+            on_complete=on_output_complete,
+            save_files=self.config.save_files,
+        )
+        
+        # Initialize GPU workers
+        self.worker_pool = GPUWorkerPool(self.config)
+        self.worker_pool.start()
+        
+        print("\n" + "="*70)
+        print("Waiting for encoder initialization...")
+        print("="*70)
+        if not self.worker_pool.wait_all_ready(timeout=300):
+            print("ERROR: Workers failed to initialize within timeout")
+            return
+        print("="*70 + "\n")
+        
+        # Start processing thread
+        self.running = True
+        self.start_time = time.time()
+        self.process_thread = threading.Thread(
+            target=self._process_loop,
+            name="ProcessLoop",
+            daemon=True
+        )
+        self.process_thread.start()
+        
+        # Create WebRTC camera pipelines
+        self.cameras = {
+            0: WebRTCCameraPipeline(
+                camera_id=0,
+                config=self.config,
+                frame_callback=self._on_frame,
+            ),
+            1: WebRTCCameraPipeline(
+                camera_id=1,
+                config=self.config,
+                frame_callback=self._on_frame,
+            ),
+        }
+        
+        # Start camera pipelines
+        for camera in self.cameras.values():
+            camera.start()
+        
+        # Start signaling server
+        self.signaling_server = WebRTCSignalingServer(self.config, self.cameras)
+        self.signaling_server.start()
+        
+        # Start web client server (serves the HTML page over HTTP)
+        # Note: Only WebSocket signaling uses SSL, not the HTML page server
+        self.web_client_server = WebClientServer(
+            port=self.config.web_client_port,
+            verbose=self.config.verbose,
+            signaling_port=self.config.webrtc_port,
+        )
+        self.web_client_server.start()
+        
+        # Set up duration timeout if configured
+        if self.config.duration_seconds > 0:
+            def on_timeout():
+                print(f"\n[Timer] Duration of {self.config.duration_seconds}s reached")
+                self._request_stop()
+                return False
+            GLib.timeout_add(int(self.config.duration_seconds * 1000), on_timeout)
+        
+        # Status reporting
+        def report_status():
+            if not self.running:
+                return False
+            elapsed = time.time() - self.start_time
+            cam0_status = "✓" if self.cameras[0].connected else "✗"
+            cam1_status = "✓" if self.cameras[1].connected else "✗"
+            print(f"[Status] Elapsed: {elapsed:.1f}s | Cameras: [{cam0_status}|{cam1_status}] | Queued: {self.frame_pairs_queued} | Processed: {self.frame_pairs_processed}")
+            return True
+        GLib.timeout_add(5000, report_status)
+        
+        # Print connection instructions
+        is_ssl = bool(self.config.ssl_cert and self.config.ssl_key)
+        ws_proto = "wss" if is_ssl else "ws"
+        
+        print("\n" + "="*70)
+        print("WebRTC Server Ready" + (" (WSS Enabled 🔒)" if is_ssl else ""))
+        print("="*70)
+        print(f"\n📱 Open the client in your browser:")
+        print(f"   http://YOUR_IP:{self.config.web_client_port}")
+        print(f"\n🔌 Signaling WebSocket:")
+        print(f"   {ws_proto}://YOUR_IP:{self.config.webrtc_port}")
+        if not is_ssl:
+            print(f"\n⚠️  For iOS/mobile: Use --generate-ssl for secure WebSocket")
+        else:
+            print(f"\n✅ WSS enabled for signaling - iOS/mobile camera access should work")
+            print(f"   (Accept the self-signed certificate warning when connecting)")
+        print("="*70)
+        print("\nServer running. Press Ctrl+C to stop.\n")
+        
+        # Run main loop
+        self.main_loop = GLib.MainLoop()
+        try:
+            self.main_loop.run()
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+        finally:
+            self.stop()
+    
+    def _request_stop(self):
+        """Request the server to stop."""
+        if self.main_loop and self.main_loop.is_running():
+            GLib.idle_add(self.main_loop.quit)
+    
+    def stop(self):
+        """Stop the server."""
+        print("\nStopping WebRTC server...")
+        
+        self.running = False
+        
+        if self.main_loop and self.main_loop.is_running():
+            self.main_loop.quit()
+        
+        # Stop web client server
+        if self.web_client_server:
+            self.web_client_server.stop()
+        
+        # Stop signaling server
+        if self.signaling_server:
+            self.signaling_server.stop()
+        
+        # Stop cameras
+        for camera in self.cameras.values():
+            camera.stop()
+        
+        # Stop worker pool
+        if self.worker_pool:
+            self.worker_pool.stop()
+        
+        # Stop process thread
+        if self.process_thread:
+            self.process_queue.put(None)
+            self.process_thread.join(timeout=5.0)
+        
+        print("WebRTC server stopped")
+    
+    def _on_frame(self, camera_id: int, timestamp_ns: int, frame: np.ndarray):
+        """Handle incoming frame from a WebRTC camera."""
+        if not self.running:
+            return
+        
+        if self.config.max_frame_pairs > 0 and self.frame_pairs_queued >= self.config.max_frame_pairs:
+            return
+        
+        # Synchronize with other camera
+        result = self.synchronizer.add_frame(camera_id, timestamp_ns, frame)
+        
+        if result is not None:
+            sync_seq_id, frames_dict = result
+            
+            # Rate limiting
+            if self.min_frame_interval > 0:
+                current_time = time.time()
+                elapsed = current_time - self.last_process_time
+                if elapsed < self.min_frame_interval:
+                    return
+                self.last_process_time = current_time
+            
+            # Assign sequential processing ID
+            with self.seq_counter_lock:
+                proc_seq_id = self.processing_seq_counter
+                self.processing_seq_counter += 1
+            
+            # Queue for processing
+            try:
+                self.process_queue.put_nowait((proc_seq_id, frames_dict))
+                self.frame_pairs_queued += 1
+                
+                if self.config.verbose:
+                    print(f"[Queue] Frame pair {proc_seq_id} queued (sync_seq={sync_seq_id})")
+                
+            except queue.Full:
+                if self.config.verbose:
+                    print(f"[Queue] Dropping frame pair (queue full)")
+    
+    def _process_loop(self):
+        """Process queued frame pairs."""
+        while self.running:
+            try:
+                item = self.process_queue.get(timeout=1.0)
+                if item is None:
+                    break
+                
+                seq_id, frames_dict = item
+                
+                self.worker_pool.submit(
+                    seq_id,
+                    frames_dict,
+                    self.output_sequencer.add_result
+                )
+                
+            except queue.Empty:
+                continue
+
+
+# ============================================================================
 # Main Server
 # ============================================================================
 
@@ -1515,6 +2503,96 @@ def create_rtsp_config(url_0: str, url_1: str) -> ServerConfig:
     )
 
 
+def create_webrtc_config(
+    port: int = 8080,
+    stun_server: str = "stun://stun.l.google.com:19302",
+) -> ServerConfig:
+    """
+    Create a configuration for WebRTC camera input.
+    
+    Args:
+        port: Port for WebRTC signaling server
+        stun_server: STUN server URL for ICE
+    """
+    return ServerConfig(
+        input_width=1280,
+        input_height=720,
+        input_framerate=30,
+        webrtc_port=port,
+        stun_server=stun_server,
+        frame_skip=1,
+        max_fps=10.0,
+        verbose=True,
+    )
+
+
+def generate_self_signed_cert(
+    ssl_dir: str = "/workspace/ssl",
+    cert_name: str = "cert.pem",
+    key_name: str = "key.pem",
+    days: int = 365,
+    verbose: bool = True,
+) -> tuple[str, str]:
+    """
+    Generate a self-signed SSL certificate for HTTPS/WSS.
+    
+    Args:
+        ssl_dir: Directory to store certificates
+        cert_name: Certificate filename
+        key_name: Private key filename
+        days: Certificate validity in days
+        verbose: Print progress messages
+        
+    Returns:
+        Tuple of (cert_path, key_path)
+    """
+    ssl_path = Path(ssl_dir)
+    ssl_path.mkdir(parents=True, exist_ok=True)
+    
+    cert_path = ssl_path / cert_name
+    key_path = ssl_path / key_name
+    
+    # Check if certificates already exist
+    if cert_path.exists() and key_path.exists():
+        if verbose:
+            print(f"[SSL] Using existing certificates in {ssl_dir}")
+        return str(cert_path), str(key_path)
+    
+    if verbose:
+        print(f"[SSL] Generating self-signed certificate...")
+    
+    # Generate using openssl
+    cmd = [
+        "openssl", "req", "-x509",
+        "-newkey", "rsa:4096",
+        "-keyout", str(key_path),
+        "-out", str(cert_path),
+        "-days", str(days),
+        "-nodes",  # No password
+        "-subj", "/CN=localhost/O=DepthSplat/C=US",
+        "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+    ]
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        if verbose:
+            print(f"[SSL] Certificate generated:")
+            print(f"      Cert: {cert_path}")
+            print(f"      Key:  {key_path}")
+        return str(cert_path), str(key_path)
+    except subprocess.CalledProcessError as e:
+        print(f"[SSL] Failed to generate certificate: {e.stderr}")
+        raise RuntimeError(f"Failed to generate SSL certificate: {e}")
+    except FileNotFoundError:
+        print("[SSL] Error: openssl not found. Install with: apt install openssl")
+        raise RuntimeError("openssl command not found")
+
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================
@@ -1545,11 +2623,23 @@ Examples:
   
   # RTSP streams:
   python server.py --mode rtsp --rtsp0 rtsp://cam1/stream --rtsp1 rtsp://cam2/stream
+  
+  # WebRTC mode - receive streams from browsers/mobile apps:
+  python server.py --mode webrtc --webrtc-port 8080
+  
+  # WebRTC with SSL (required for iOS camera access):
+  python server.py --mode webrtc --generate-ssl
+  
+  # WebRTC with custom SSL certificates:
+  python server.py --mode webrtc --ssl-cert /path/to/cert.pem --ssl-key /path/to/key.pem
+  
+  # WebRTC with custom STUN server and output streaming:
+  python server.py --mode webrtc --webrtc-port 8080 --stun-server stun://mystun.server:3478 --websocket
 """
     )
     parser.add_argument(
         "--mode",
-        choices=["test", "file", "v4l2", "rtsp", "custom"],
+        choices=["test", "file", "v4l2", "rtsp", "webrtc", "custom"],
         default="file",
         help="Camera mode (default: file)"
     )
@@ -1652,6 +2742,50 @@ Examples:
         help="Only stream via WebSocket, don't save files to disk"
     )
     
+    # WebRTC mode arguments
+    parser.add_argument(
+        "--webrtc-port",
+        type=int,
+        default=8080,
+        help="Port for WebRTC signaling server (default: 8080)"
+    )
+    parser.add_argument(
+        "--stun-server",
+        default="stun://stun.l.google.com:19302",
+        help="STUN server URL for WebRTC ICE (default: stun://stun.l.google.com:19302)"
+    )
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=8888,
+        help="Port for serving the WebRTC client HTML page (default: 8888)"
+    )
+    
+    # SSL/TLS arguments
+    parser.add_argument(
+        "--ssl-cert",
+        type=str,
+        default=None,
+        help="Path to SSL certificate file (enables HTTPS/WSS)"
+    )
+    parser.add_argument(
+        "--ssl-key",
+        type=str,
+        default=None,
+        help="Path to SSL private key file"
+    )
+    parser.add_argument(
+        "--ssl-dir",
+        type=str,
+        default="/workspace/ssl",
+        help="Directory to store/find SSL certificates (default: /workspace/ssl)"
+    )
+    parser.add_argument(
+        "--generate-ssl",
+        action="store_true",
+        help="Generate self-signed SSL certificates if they don't exist"
+    )
+    
     args = parser.parse_args()
     
     # File-based test mode - runs without GStreamer
@@ -1708,6 +2842,86 @@ Examples:
                 output_callback=output_callback,
                 save_files=save_files,
             )
+        finally:
+            if websocket_streamer:
+                websocket_streamer.stop()
+        return
+    
+    # WebRTC mode - receive camera streams via WebRTC
+    if args.mode == "webrtc":
+        # Handle SSL certificates
+        ssl_cert = args.ssl_cert
+        ssl_key = args.ssl_key
+        
+        # Generate self-signed certificates if requested
+        if args.generate_ssl or (ssl_cert is None and ssl_key is None):
+            # Check if certs exist in ssl_dir
+            ssl_dir = Path(args.ssl_dir)
+            default_cert = ssl_dir / "cert.pem"
+            default_key = ssl_dir / "key.pem"
+            
+            if args.generate_ssl or (default_cert.exists() and default_key.exists()):
+                try:
+                    ssl_cert, ssl_key = generate_self_signed_cert(
+                        ssl_dir=args.ssl_dir,
+                        verbose=not args.quiet,
+                    )
+                except Exception as e:
+                    if args.generate_ssl:
+                        print(f"Error generating SSL certificates: {e}")
+                        return
+                    # If not explicitly requested, just continue without SSL
+                    ssl_cert = None
+                    ssl_key = None
+        
+        config = ServerConfig(
+            input_width=1280,
+            input_height=720,
+            webrtc_port=args.webrtc_port,
+            web_client_port=args.web_port,
+            stun_server=args.stun_server,
+            ssl_cert=ssl_cert,
+            ssl_key=ssl_key,
+            output_dir=args.output_dir,
+            output_format=args.format,
+            verbose=not args.quiet,
+        )
+        
+        # Apply overrides
+        if args.frame_skip is not None:
+            config.frame_skip = args.frame_skip
+        if args.max_fps is not None:
+            config.max_fps = args.max_fps
+        if args.duration > 0:
+            config.duration_seconds = args.duration
+        if args.num_frames > 0:
+            config.max_frame_pairs = args.num_frames
+        
+        # Initialize WebSocket output streamer if enabled
+        websocket_streamer = None
+        if args.websocket:
+            try:
+                from websocket_streamer import WebSocketStreamer
+                
+                websocket_streamer = WebSocketStreamer(
+                    host=args.ws_host,
+                    port=args.ws_port,
+                    output_format=args.format,
+                    verbose=not args.quiet,
+                )
+                websocket_streamer.start()
+                config.output_callback = websocket_streamer.broadcast_frame
+                
+                if args.ws_only:
+                    config.save_files = False
+                    
+            except ImportError as e:
+                print(f"Warning: Could not enable WebSocket output streaming: {e}")
+        
+        # Start WebRTC server
+        server = WebRTCDepthSplatServer(config)
+        try:
+            server.start()
         finally:
             if websocket_streamer:
                 websocket_streamer.stop()

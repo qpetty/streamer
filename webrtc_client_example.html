@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DepthSplat WebRTC Camera Client</title>
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --accent: #58a6ff;
+            --accent-hover: #79b8ff;
+            --success: #3fb950;
+            --error: #f85149;
+            --warning: #d29922;
+            --border: #30363d;
+        }
+        
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            font-size: 1.75rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--accent) 0%, #a371f7 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .subtitle {
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        
+        @media (max-width: 900px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.5rem;
+        }
+        
+        .card-header {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+        
+        .card-title {
+            font-size: 1rem;
+            font-weight: 600;
+        }
+        
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--text-secondary);
+        }
+        
+        .status-dot.connected {
+            background: var(--success);
+            box-shadow: 0 0 8px var(--success);
+        }
+        
+        .status-dot.connecting {
+            background: var(--warning);
+            animation: pulse 1s infinite;
+        }
+        
+        .status-dot.error {
+            background: var(--error);
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .video-container {
+            position: relative;
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            overflow: hidden;
+            aspect-ratio: 16/9;
+        }
+        
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .video-label {
+            position: absolute;
+            bottom: 0.5rem;
+            left: 0.5rem;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+        
+        .controls {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+            margin-bottom: 1.5rem;
+        }
+        
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+        
+        label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        input[type="text"], input[type="number"] {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 0.5rem 0.75rem;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            width: 200px;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        
+        select {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 0.5rem 0.75rem;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            cursor: pointer;
+        }
+        
+        button {
+            background: var(--accent);
+            color: var(--bg-primary);
+            border: none;
+            border-radius: 6px;
+            padding: 0.5rem 1.25rem;
+            font-size: 0.875rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        button:hover {
+            background: var(--accent-hover);
+        }
+        
+        button:disabled {
+            background: var(--text-secondary);
+            cursor: not-allowed;
+        }
+        
+        button.secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+        
+        button.secondary:hover {
+            background: var(--border);
+        }
+        
+        .log-container {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 1rem;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 0.75rem;
+        }
+        
+        .log-entry {
+            margin-bottom: 0.25rem;
+            display: flex;
+            gap: 0.5rem;
+        }
+        
+        .log-time {
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+        
+        .log-message {
+            word-break: break-all;
+        }
+        
+        .log-entry.error .log-message {
+            color: var(--error);
+        }
+        
+        .log-entry.success .log-message {
+            color: var(--success);
+        }
+        
+        .log-entry.info .log-message {
+            color: var(--accent);
+        }
+        
+        .instructions {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        
+        .instructions h2 {
+            font-size: 1rem;
+            margin-bottom: 1rem;
+        }
+        
+        .instructions ol {
+            margin-left: 1.5rem;
+            color: var(--text-secondary);
+        }
+        
+        .instructions li {
+            margin-bottom: 0.5rem;
+        }
+        
+        .instructions code {
+            background: var(--bg-tertiary);
+            padding: 0.125rem 0.375rem;
+            border-radius: 4px;
+            font-size: 0.875rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="httpsWarningBanner" style="display: none; margin-bottom: 1rem; padding: 1rem; background: linear-gradient(135deg, #5c2626 0%, #2d1b1b 100%); border: 1px solid #f85149; border-radius: 8px;">
+            <strong style="color: #f85149;">🔒 HTTPS Required for Camera Access</strong>
+            <p style="color: #c9d1d9; margin: 0.5rem 0 0 0; font-size: 0.875rem;">
+                This page is not served over HTTPS. Camera access will not work on iOS/mobile devices.
+                Use <code style="background: #21262d; padding: 0.125rem 0.375rem; border-radius: 4px;">ngrok http YOUR_SERVER_PORT</code> to create a secure tunnel.
+            </p>
+        </div>
+        <h1>DepthSplat WebRTC Camera Client</h1>
+        <p class="subtitle">Stream camera video to the DepthSplat server via WebRTC</p>
+        
+        <div class="instructions">
+            <h2>How to Use</h2>
+            <ol>
+                <li>Start the server with SSL: <code>python server.py --mode webrtc --generate-ssl</code></li>
+                <li>Enter the server IP address, check "Use SSL", and click "Connect"</li>
+                <li>Accept the self-signed certificate warning in your browser</li>
+                <li>Allow camera access when prompted</li>
+                <li>Select which camera slot (0 or 1) to use</li>
+                <li>Click "Start Streaming" to begin sending video</li>
+                <li>Open another browser tab/device to stream as Camera 1</li>
+            </ol>
+            <div id="securityWarning" style="margin-top: 1rem; padding: 0.75rem; background: #2d1b1b; border: 1px solid #f85149; border-radius: 6px; display: none;">
+                <strong style="color: #f85149;">⚠️ iOS/Mobile Users:</strong>
+                <span style="color: #c9d1d9;">Camera access requires HTTPS. The server supports SSL:</span>
+                <ul style="margin: 0.5rem 0 0 1.5rem; color: #8b949e;">
+                    <li>Run server with <code>--generate-ssl</code> flag</li>
+                    <li>Check "Use SSL" checkbox above</li>
+                    <li>Accept the certificate warning in browser</li>
+                </ul>
+            </div>
+        </div>
+        
+        <script>
+            // Show security warnings if not in secure context
+            if (!window.isSecureContext) {
+                document.getElementById('httpsWarningBanner').style.display = 'block';
+                if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
+                    document.getElementById('securityWarning').style.display = 'block';
+                }
+            }
+        </script>
+        
+        <div class="controls">
+            <div class="input-group">
+                <label>Server Host</label>
+                <input type="text" id="serverHost" value="localhost" placeholder="localhost or IP">
+            </div>
+            <div class="input-group">
+                <label>Port</label>
+                <input type="number" id="serverPort" value="8080" min="1" max="65535">
+            </div>
+            <div class="input-group">
+                <label>Use SSL</label>
+                <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; text-transform: none; font-size: 0.875rem;">
+                    <input type="checkbox" id="useSSL" style="width: auto;" onchange="updateProtocol()">
+                    <span id="protocolLabel">ws://</span>
+                </label>
+            </div>
+            <div class="input-group">
+                <label>Camera ID</label>
+                <select id="cameraId">
+                    <option value="0">Camera 0</option>
+                    <option value="1">Camera 1</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <label>&nbsp;</label>
+                <button id="connectBtn" onclick="connect()">Connect</button>
+            </div>
+            <div class="input-group">
+                <label>&nbsp;</label>
+                <button id="startBtn" onclick="startStreaming()" disabled>Start Streaming</button>
+            </div>
+            <div class="input-group">
+                <label>&nbsp;</label>
+                <button id="stopBtn" class="secondary" onclick="stopStreaming()" disabled>Stop</button>
+            </div>
+        </div>
+        
+        <div class="grid">
+            <div class="card">
+                <div class="card-header">
+                    <span class="status-dot" id="localStatus"></span>
+                    <span class="card-title">Local Camera Preview</span>
+                </div>
+                <div class="video-container">
+                    <video id="localVideo" autoplay muted playsinline></video>
+                    <span class="video-label">Your Camera</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div class="card-header">
+                    <span class="status-dot" id="connectionStatus"></span>
+                    <span class="card-title">Connection Status</span>
+                </div>
+                <div class="log-container" id="logContainer">
+                    <div class="log-entry info">
+                        <span class="log-time">[--:--:--]</span>
+                        <span class="log-message">Ready to connect...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let websocket = null;
+        let peerConnection = null;
+        let localStream = null;
+        
+        const config = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' }
+            ]
+        };
+        
+        // Auto-configure from server-injected environment variables
+        window.addEventListener('DOMContentLoaded', () => {
+            // Auto-detect SSL based on page protocol
+            if (window.location.protocol === 'https:') {
+                document.getElementById('useSSL').checked = true;
+                updateProtocol();
+            }
+            
+            // Use RunPod environment variables if available (injected by server)
+            if (window.RUNPOD_PUBLIC_IP) {
+                document.getElementById('serverHost').value = window.RUNPOD_PUBLIC_IP;
+                console.log('Auto-configured host from RUNPOD_PUBLIC_IP:', window.RUNPOD_PUBLIC_IP);
+            }
+            
+            if (window.RUNPOD_TCP_PORT_8080) {
+                document.getElementById('serverPort').value = window.RUNPOD_TCP_PORT_8080;
+                // RunPod TCP ports typically require SSL
+                document.getElementById('useSSL').checked = true;
+                updateProtocol();
+                console.log('Auto-configured port from RUNPOD_TCP_PORT_8080:', window.RUNPOD_TCP_PORT_8080);
+            } else if (window.DEFAULT_SIGNALING_PORT) {
+                document.getElementById('serverPort').value = window.DEFAULT_SIGNALING_PORT;
+            }
+        });
+        
+        function updateProtocol() {
+            const useSSL = document.getElementById('useSSL').checked;
+            document.getElementById('protocolLabel').textContent = useSSL ? 'wss://' : 'ws://';
+        }
+        
+        function log(message, type = 'default') {
+            const container = document.getElementById('logContainer');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            
+            const time = new Date().toLocaleTimeString();
+            entry.innerHTML = `
+                <span class="log-time">[${time}]</span>
+                <span class="log-message">${message}</span>
+            `;
+            
+            container.appendChild(entry);
+            container.scrollTop = container.scrollHeight;
+        }
+        
+        function setStatus(elementId, status) {
+            const el = document.getElementById(elementId);
+            el.className = 'status-dot ' + status;
+        }
+        
+        async function connect() {
+            const host = document.getElementById('serverHost').value;
+            const port = document.getElementById('serverPort').value;
+            const cameraId = parseInt(document.getElementById('cameraId').value);
+            const useSSL = document.getElementById('useSSL').checked;
+            
+            const protocol = useSSL ? 'wss' : 'ws';
+            const wsUrl = `${protocol}://${host}:${port}`;
+            
+            log(`Connecting to ${wsUrl}...`, 'info');
+            setStatus('connectionStatus', 'connecting');
+            
+            try {
+                websocket = new WebSocket(wsUrl);
+                
+                websocket.onopen = () => {
+                    log('WebSocket connected', 'success');
+                    log(`Registering as camera ${cameraId}...`, 'info');
+                    
+                    // Register for a camera slot
+                    websocket.send(JSON.stringify({
+                        type: 'register',
+                        camera_id: cameraId
+                    }));
+                };
+                
+                websocket.onmessage = async (event) => {
+                    const data = JSON.parse(event.data);
+                    
+                    switch (data.type) {
+                        case 'registered':
+                            log(`Registered as camera ${data.camera_id}`, 'success');
+                            setStatus('connectionStatus', 'connected');
+                            document.getElementById('connectBtn').disabled = true;
+                            document.getElementById('startBtn').disabled = false;
+                            break;
+                            
+                        case 'answer':
+                            log('Received SDP answer', 'info');
+                            await peerConnection.setRemoteDescription({
+                                type: 'answer',
+                                sdp: data.sdp
+                            });
+                            log('Remote description set', 'success');
+                            break;
+                            
+                        case 'ice':
+                            log('Received ICE candidate', 'info');
+                            if (data.candidate) {
+                                await peerConnection.addIceCandidate({
+                                    candidate: data.candidate,
+                                    sdpMLineIndex: data.sdpMLineIndex
+                                });
+                            }
+                            break;
+                            
+                        case 'error':
+                            log(`Error: ${data.message}`, 'error');
+                            setStatus('connectionStatus', 'error');
+                            break;
+                            
+                        default:
+                            log(`Unknown message: ${data.type}`, 'default');
+                    }
+                };
+                
+                websocket.onclose = () => {
+                    log('WebSocket disconnected', 'error');
+                    setStatus('connectionStatus', '');
+                    document.getElementById('connectBtn').disabled = false;
+                    document.getElementById('startBtn').disabled = true;
+                };
+                
+                websocket.onerror = (error) => {
+                    log(`WebSocket error: ${error.message || 'Connection failed'}`, 'error');
+                    setStatus('connectionStatus', 'error');
+                };
+                
+            } catch (error) {
+                log(`Connection error: ${error.message}`, 'error');
+                setStatus('connectionStatus', 'error');
+            }
+        }
+        
+        async function startStreaming() {
+            try {
+                // Check if we're in a secure context (required for getUserMedia on iOS)
+                if (!window.isSecureContext) {
+                    throw new Error(
+                        'Camera access requires HTTPS. ' +
+                        'Please serve this page over HTTPS or use localhost. ' +
+                        'On iOS, you can use a tool like ngrok to create an HTTPS tunnel.'
+                    );
+                }
+                
+                // Check if getUserMedia is available
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error(
+                        'getUserMedia not available. This can happen if:\n' +
+                        '• Page is not served over HTTPS (required on iOS)\n' +
+                        '• Browser doesn\'t support WebRTC\n' +
+                        '• Running in a restricted WebView'
+                    );
+                }
+                
+                // Get camera stream
+                log('Requesting camera access...', 'info');
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 },
+                        frameRate: { ideal: 30 },
+                        facingMode: { ideal: 'environment' }  // Prefer back camera on mobile
+                    },
+                    audio: false
+                });
+                
+                // Show local preview
+                const localVideo = document.getElementById('localVideo');
+                localVideo.srcObject = localStream;
+                setStatus('localStatus', 'connected');
+                log('Camera access granted', 'success');
+                
+                // Create peer connection
+                peerConnection = new RTCPeerConnection(config);
+                
+                // Add tracks to peer connection
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);
+                });
+                
+                // Handle ICE candidates
+                peerConnection.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        log('Sending ICE candidate', 'info');
+                        websocket.send(JSON.stringify({
+                            type: 'ice',
+                            candidate: event.candidate.candidate,
+                            sdpMLineIndex: event.candidate.sdpMLineIndex
+                        }));
+                    }
+                };
+                
+                peerConnection.oniceconnectionstatechange = () => {
+                    log(`ICE connection state: ${peerConnection.iceConnectionState}`, 'info');
+                    
+                    if (peerConnection.iceConnectionState === 'connected') {
+                        setStatus('connectionStatus', 'connected');
+                        log('WebRTC connection established!', 'success');
+                    } else if (peerConnection.iceConnectionState === 'failed') {
+                        setStatus('connectionStatus', 'error');
+                        log('WebRTC connection failed', 'error');
+                    }
+                };
+                
+                // Create and send offer
+                log('Creating offer...', 'info');
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                
+                log('Sending offer to server...', 'info');
+                websocket.send(JSON.stringify({
+                    type: 'offer',
+                    sdp: offer.sdp
+                }));
+                
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = false;
+                
+            } catch (error) {
+                log(`Error starting stream: ${error.message}`, 'error');
+                setStatus('localStatus', 'error');
+            }
+        }
+        
+        function stopStreaming() {
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            
+            document.getElementById('localVideo').srcObject = null;
+            setStatus('localStatus', '');
+            
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            
+            log('Streaming stopped', 'info');
+        }
+    </script>
+</body>
+</html>
+
