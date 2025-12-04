@@ -54,6 +54,9 @@ Usage:
     # RTMP streams:
     python server.py --mode rtmp --rtmp0 rtmp://server/live/stream1 --rtmp1 rtmp://server/live/stream2
     
+    # SRT streams (listener mode - iOS devices send to server):
+    python server.py --mode srt --srt-listen
+    
     # WebRTC mode (receive streams from browsers/mobile apps):
     python server.py --mode webrtc --webrtc-port 8080
     
@@ -2793,6 +2796,42 @@ def create_rtmp_config(url_0: str, url_1: str) -> ServerConfig:
     )
 
 
+def create_srt_config(url_0: str, url_1: str) -> ServerConfig:
+    """
+    Create a configuration for SRT (Secure Reliable Transport) streams.
+    
+    SRT provides low-latency, reliable video transport with built-in encryption.
+    Uses srtsrc element with decodebin for automatic codec detection.
+    
+    Uses frame-count-based sync since SRT streams from different devices
+    have unsynchronized timestamps.
+    
+    Note: Each camera requires a separate port. GStreamer's srtsrc elements
+    cannot share a port even with different streamids (they conflict at the
+    socket level).
+    
+    URI formats:
+        - Listener mode (server waits for connection): srt://:8080?mode=listener
+        - Caller mode (connect to sender): srt://host:8080?mode=caller
+        - Default mode (caller): srt://host:8080
+    
+    Args:
+        url_0: SRT URL for camera 0 (e.g., srt://:8080?mode=listener)
+        url_1: SRT URL for camera 1 (e.g., srt://:8081?mode=listener)
+    """
+    return ServerConfig(
+        camera_0_source=f'srtsrc uri="{url_0}" ! decodebin ! videoconvert',
+        camera_1_source=f'srtsrc uri="{url_1}" ! decodebin ! videoconvert',
+        input_width=1920,
+        input_height=1080,
+        input_framerate=30,
+        frame_skip=2,
+        max_fps=15.0,
+        use_frame_count_sync=True,  # Use frame count sync since SRT devices have different clocks
+        verbose=True,
+    )
+
+
 def create_webrtc_config(
     port: int = 8080,
     stun_server: str = "stun://stun.l.google.com:19302",
@@ -2917,6 +2956,15 @@ Examples:
   # RTMP streams:
   python server.py --mode rtmp --rtmp0 rtmp://server/live/cam1 --rtmp1 rtmp://server/live/cam2
   
+  # SRT streams (listener mode - iOS devices send to server):
+  python server.py --mode srt --srt-listen
+  
+  # SRT streams (listener mode - custom ports):
+  python server.py --mode srt --srt-listen 9000,9001
+  
+  # SRT streams (caller mode - connect to senders):
+  python server.py --mode srt --srt0 srt://192.168.1.100:8080 --srt1 srt://192.168.1.100:8081
+  
   # WebRTC mode - receive streams from browsers/mobile apps:
   python server.py --mode webrtc --webrtc-port 8080
   
@@ -2932,7 +2980,7 @@ Examples:
     )
     parser.add_argument(
         "--mode",
-        choices=["test", "file", "v4l2", "rtsp", "rtmp", "webrtc", "custom"],
+        choices=["test", "file", "v4l2", "rtsp", "rtmp", "srt", "webrtc", "custom"],
         default="file",
         help="Camera mode (default: file)"
     )
@@ -2966,6 +3014,21 @@ Examples:
     parser.add_argument(
         "--rtmp1",
         help="RTMP URL for camera 1 (e.g., rtmp://server/live/stream2)"
+    )
+    parser.add_argument(
+        "--srt0",
+        help="SRT URL for camera 0 (e.g., srt://host:8080 or srt://:8080?mode=listener)"
+    )
+    parser.add_argument(
+        "--srt1",
+        help="SRT URL for camera 1 (e.g., srt://host:8081 or srt://:8081?mode=listener)"
+    )
+    parser.add_argument(
+        "--srt-listen",
+        nargs="?",
+        const="8080,8081",
+        metavar="PORT0,PORT1",
+        help="SRT listener mode: wait for connections on specified ports (default: 8080,8081)"
     )
     parser.add_argument(
         "--frame-skip",
@@ -3254,6 +3317,46 @@ Examples:
         if not args.rtmp0 or not args.rtmp1:
             parser.error("RTMP mode requires --rtmp0 and --rtmp1 URLs")
         config = create_rtmp_config(args.rtmp0, args.rtmp1)
+    elif args.mode == "srt":
+        # Handle --srt-listen shorthand for listener mode (separate ports required)
+        if args.srt_listen:
+            ports = args.srt_listen.split(",")
+            port0 = ports[0].strip() if len(ports) > 0 else "8080"
+            port1 = ports[1].strip() if len(ports) > 1 else "8081"
+            args.srt0 = f"srt://:{port0}?mode=listener"
+            args.srt1 = f"srt://:{port1}?mode=listener"
+        
+        if not args.srt0 or not args.srt1:
+            parser.error("SRT mode requires --srt0 and --srt1 URLs, or use --srt-listen for listener mode")
+        config = create_srt_config(args.srt0, args.srt1)
+        
+        # Print connection info for SRT listener mode
+        if "mode=listener" in args.srt0 or "mode=listener" in args.srt1:
+            import socket
+            try:
+                # Get actual IP address (not just hostname)
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+            except:
+                local_ip = "YOUR_SERVER_IP"
+            
+            # Extract ports from URLs
+            import re
+            port0_match = re.search(r':(\d+)', args.srt0)
+            port1_match = re.search(r':(\d+)', args.srt1)
+            port0 = port0_match.group(1) if port0_match else "8080"
+            port1 = port1_match.group(1) if port1_match else "8081"
+            
+            print("\n" + "="*70)
+            print("SRT LISTENER MODE - Connection URLs for iOS devices")
+            print("="*70)
+            print(f"\n📱 Camera 0 (iOS device 1) should connect to:")
+            print(f"   srt://{local_ip}:{port0}")
+            print(f"\n📱 Camera 1 (iOS device 2) should connect to:")
+            print(f"   srt://{local_ip}:{port1}")
+            print("\n" + "="*70 + "\n")
     else:
         config = ServerConfig()
     
