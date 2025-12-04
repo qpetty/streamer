@@ -123,6 +123,7 @@ import asyncio
 import json
 import ssl
 import subprocess
+import os
 import numpy as np
 import torch
 from pathlib import Path
@@ -130,6 +131,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable, Dict, Any
 from collections import OrderedDict
 import io
+from PIL import Image
 
 # ============================================================================
 # Import DepthSplat inference from ../depthsplat
@@ -252,6 +254,10 @@ class ServerConfig:
     # --- Debug Settings ---
     verbose: bool = True
     save_input_frames: bool = False  # Save input frames for debugging
+    
+    # Directory to save camera input frames before inference (None = don't save)
+    # When set, frames are saved as camera_input_dir/seq_XXXXX_cam0.png and seq_XXXXX_cam1.png
+    camera_input_dir: Optional[str] = None
     
     # --- Sync Settings ---
     # Use frame count sync instead of timestamp sync (better for test sources)
@@ -585,6 +591,24 @@ class GPUWorker:
             
             # Get original image dimensions
             orig_height, orig_width = frame_0.shape[:2]
+            
+            # Save camera input frames if enabled
+            if self.config.camera_input_dir:
+                save_dir = Path(self.config.camera_input_dir)
+                save_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Save both frames as PNG
+                img_0 = Image.fromarray(frame_0)
+                img_1 = Image.fromarray(frame_1)
+                
+                path_0 = save_dir / f"seq_{seq_id:05d}_cam0.png"
+                path_1 = save_dir / f"seq_{seq_id:05d}_cam1.png"
+                
+                img_0.save(path_0)
+                img_1.save(path_1)
+                
+                if self.config.verbose:
+                    print(f"[Worker {self.gpu_id}:{self.worker_id}] Saved input frames to {path_0} and {path_1}")
             
             if self.config.verbose:
                 print(f"[Worker {self.gpu_id}:{self.worker_id}] Running DepthAnything3 on seq {seq_id}")
@@ -1682,6 +1706,8 @@ class WebRTCDepthSplatServer:
         print(f"Target resolution: {self.config.target_width}x{self.config.target_height}")
         print(f"Frame skip: {self.config.frame_skip}")
         print(f"Max FPS: {self.config.max_fps if self.config.max_fps > 0 else 'unlimited'}")
+        if self.config.camera_input_dir:
+            print(f"Camera input save: {self.config.camera_input_dir}")
         print("="*70)
         
         # Initialize output sequencer
@@ -1951,6 +1977,8 @@ class DepthSplatServer:
         print(f"Duration: {self.config.duration_seconds}s" if self.config.duration_seconds > 0 else "Duration: unlimited")
         print(f"Max frame pairs: {self.config.max_frame_pairs}" if self.config.max_frame_pairs > 0 else "Max frame pairs: unlimited")
         print(f"Sync mode: {'frame count' if self.config.use_frame_count_sync else 'timestamp'}")
+        if self.config.camera_input_dir:
+            print(f"Camera input save: {self.config.camera_input_dir}")
         print("="*70)
         
         # Initialize components
@@ -2746,6 +2774,16 @@ Examples:
         help="Only stream via WebSocket, don't save files to disk"
     )
     
+    # Camera input save argument
+    parser.add_argument(
+        "--save-camera-input",
+        nargs="?",
+        const="camera-input",
+        default=None,
+        metavar="DIR",
+        help="Save camera input frames to disk before inference. Optional directory name (default: camera-input)"
+    )
+    
     # WebRTC mode arguments
     parser.add_argument(
         "--webrtc-port",
@@ -2900,6 +2938,8 @@ Examples:
             config.duration_seconds = args.duration
         if args.num_frames > 0:
             config.max_frame_pairs = args.num_frames
+        if args.save_camera_input is not None:
+            config.camera_input_dir = args.save_camera_input
         
         # Initialize WebSocket output streamer if enabled
         websocket_streamer = None
@@ -2957,6 +2997,8 @@ Examples:
     config.output_dir = args.output_dir
     config.output_format = args.format
     config.verbose = not args.quiet
+    if args.save_camera_input is not None:
+        config.camera_input_dir = args.save_camera_input
     
     # Initialize WebSocket streamer if enabled
     websocket_streamer = None
