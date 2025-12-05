@@ -172,6 +172,7 @@ class WebSocketStreamer:
         
         # Statistics
         self.stats = StreamerStats()
+        self.frames_dropped = 0  # Track dropped frames
         
         # Async event loop (runs in background thread)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -179,9 +180,13 @@ class WebSocketStreamer:
         self._server = None
         self._running = False
         
-        # Frame queue for thread-safe broadcasting
+        # Frame queue for thread-safe broadcasting with backpressure
         self._frame_queue: deque = deque(maxlen=max_queue_size)
+        self._queue_lock = threading.Lock()
         self._frame_event: Optional[asyncio.Event] = None
+        
+        # Track in-flight sends to detect backlog
+        self._send_in_progress = False
         
     def start(self) -> None:
         """Start the WebSocket server in a background thread."""
@@ -231,6 +236,8 @@ class WebSocketStreamer:
         This method is thread-safe and can be called from any thread.
         It's designed to be used as the output_callback for ServerConfig.
         
+        Uses a queue with dropping to prevent backlog when sends are slow.
+        
         Args:
             seq_id: Sequence ID of the frame
             output_bytes: Gaussian splat data (SPZ or PLY bytes)
@@ -253,17 +260,37 @@ class WebSocketStreamer:
         )
         message = header + output_bytes
         
-        # Schedule broadcast on the event loop
-        asyncio.run_coroutine_threadsafe(
-            self._async_broadcast(seq_id, message),
-            self._loop
-        )
+        # Add to queue with dropping (thread-safe)
+        with self._queue_lock:
+            # Check if queue is full - if so, drop oldest
+            if len(self._frame_queue) >= self.max_queue_size:
+                dropped = self._frame_queue.popleft()
+                self.frames_dropped += 1
+                if self.verbose:
+                    logger.warning(f"[WS] Dropped seq {dropped[0]} from send queue (queue overflow, total dropped: {self.frames_dropped})")
+            
+            self._frame_queue.append((seq_id, message))
+            queue_len = len(self._frame_queue)
+            sending = self._send_in_progress
+        
+        # Log queue status if backing up
+        if queue_len > 1 and self.verbose:
+            logger.debug(f"[WS] Queued seq {seq_id}, queue size: {queue_len}, send_in_progress: {sending}")
+        
+        # Signal the sender task that there's work
+        if self._frame_event is not None:
+            self._loop.call_soon_threadsafe(self._frame_event.set)
         
     def get_stats(self) -> dict:
         """Get current streamer statistics."""
         with self._clients_lock:
             self.stats.current_clients = len(self._clients)
-        return self.stats.to_dict()
+        stats = self.stats.to_dict()
+        stats["frames_dropped"] = self.frames_dropped
+        with self._queue_lock:
+            stats["queue_size"] = len(self._frame_queue)
+        stats["send_in_progress"] = self._send_in_progress
+        return stats
         
     def get_client_count(self) -> int:
         """Get current number of connected clients."""
@@ -289,6 +316,9 @@ class WebSocketStreamer:
             
     async def _serve(self) -> None:
         """Main server coroutine."""
+        # Create the frame event for signaling
+        self._frame_event = asyncio.Event()
+        
         server = await serve(
             self._handle_client,
             self.host,
@@ -300,14 +330,57 @@ class WebSocketStreamer:
         self._server = server
         logger.info(f"WebSocket server listening on ws://{self.host}:{self.port}")
         
+        # Start the sender task
+        sender_task = asyncio.create_task(self._sender_loop())
+        
         try:
             # Keep running until stopped
             while self._running:
                 await asyncio.sleep(0.1)
         finally:
+            # Stop sender task
+            sender_task.cancel()
+            try:
+                await sender_task
+            except asyncio.CancelledError:
+                pass
+            
             # Gracefully close the server
             server.close()
             await server.wait_closed()
+            
+    async def _sender_loop(self) -> None:
+        """Background task that processes the send queue."""
+        while self._running:
+            # Wait for frames to be available
+            await self._frame_event.wait()
+            self._frame_event.clear()
+            
+            # Process all queued frames (send only the most recent)
+            while True:
+                # Get frame from queue (thread-safe)
+                with self._queue_lock:
+                    if not self._frame_queue:
+                        break
+                    # Take ALL frames and only send the most recent
+                    # Drop intermediate frames to reduce latency
+                    frames_to_send = list(self._frame_queue)
+                    self._frame_queue.clear()
+                    
+                # Only send the LATEST frame, drop the rest
+                if len(frames_to_send) > 1:
+                    dropped_count = len(frames_to_send) - 1
+                    self.frames_dropped += dropped_count
+                    if self.verbose:
+                        dropped_seqs = [f[0] for f in frames_to_send[:-1]]
+                        logger.info(f"[WS] Dropping {dropped_count} older frames from WS queue (seqs: {dropped_seqs[:5]}) to send latest")
+                
+                seq_id, message = frames_to_send[-1]  # Take the latest
+                
+                # Send to all clients
+                self._send_in_progress = True
+                await self._async_broadcast(seq_id, message)
+                self._send_in_progress = False
                 
     async def _handle_client(self, websocket: ServerConnection) -> None:
         """Handle a client connection."""
@@ -403,6 +476,8 @@ class WebSocketStreamer:
             
     async def _async_broadcast(self, seq_id: int, message: bytes) -> None:
         """Broadcast a message to all connected clients."""
+        start_time = time.time()
+        
         with self._clients_lock:
             clients = list(self._clients)
             
@@ -424,9 +499,10 @@ class WebSocketStreamer:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
             
+        elapsed = time.time() - start_time
         if self.verbose and len(clients) > 0:
             size_kb = len(message) / 1024
-            logger.info(f"[WS] Broadcast seq {seq_id} ({size_kb:.1f}KB) to {len(tasks)} clients")
+            logger.info(f"[WS] Broadcast seq {seq_id} ({size_kb:.1f}KB) to {len(tasks)} clients in {elapsed:.2f}s")
             
     async def _send_to_client(
         self,

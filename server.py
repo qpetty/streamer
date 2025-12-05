@@ -400,10 +400,12 @@ def scale_intrinsics(
 
 class FrameSynchronizer:
     """
-    Synchronizes frames from multiple camera streams.
+    Synchronizes frames from multiple camera streams for LOW LATENCY.
     
-    Pairs frames by timestamp proximity and ensures both cameras
-    have contributed a frame before emitting a synchronized pair.
+    This synchronizer is optimized for real-time streaming:
+    - Only keeps the LATEST frame from each camera (plus minimal buffer for matching)
+    - Always uses the NEWEST synchronized pair available
+    - Discards older frames aggressively to minimize latency
     
     For test sources, uses frame count matching instead of timestamps
     since videotestsrc timestamps may not align.
@@ -413,7 +415,8 @@ class FrameSynchronizer:
         self.num_cameras = num_cameras
         self.max_time_diff_ms = max_time_diff_ms
         self.use_frame_count_sync = use_frame_count_sync
-        self.buffers = {i: OrderedDict() for i in range(num_cameras)}
+        # For low latency: only keep 1 frame per camera (the latest)
+        self.latest_frames = {i: None for i in range(num_cameras)}  # (key, timestamp_ns, frame)
         self.frame_counts = {i: 0 for i in range(num_cameras)}
         self.lock = threading.Lock()
         self.sequence_counter = 0
@@ -421,6 +424,9 @@ class FrameSynchronizer:
     def add_frame(self, camera_id: int, timestamp_ns: int, frame: np.ndarray) -> Optional[tuple]:
         """
         Add a frame from a camera and attempt to find a synchronized pair.
+        
+        LOW LATENCY: Always overwrites the previous frame from this camera.
+        When a match is found, both latest frames are used and cleared.
         
         Args:
             camera_id: Camera index (0 or 1)
@@ -438,39 +444,39 @@ class FrameSynchronizer:
                 self.frame_counts[camera_id] += 1
             else:
                 key = timestamp_ns
-                
-            self.buffers[camera_id][key] = (timestamp_ns, frame)
             
+            # LOW LATENCY: Always overwrite with the latest frame (drop old frames)
+            self.latest_frames[camera_id] = (key, timestamp_ns, frame)
             
-            # Try to find a matching pair
-            result = self._try_match()
-            
-            # Clean up old frames (keep last 30 frames per camera)
-            for cam_id in range(self.num_cameras):
-                while len(self.buffers[cam_id]) > 30:
-                    self.buffers[cam_id].popitem(last=False)
-            
-            return result
+            # Try to find a matching pair using latest frames
+            return self._try_match()
     
     def _try_match(self) -> Optional[tuple]:
-        """Try to find a synchronized frame pair."""
+        """Try to find a synchronized frame pair using the LATEST frames."""
         # Need frames from all cameras
-        if any(len(self.buffers[i]) == 0 for i in range(self.num_cameras)):
+        if any(self.latest_frames[i] is None for i in range(self.num_cameras)):
             return None
         
+        frame_0_data = self.latest_frames[0]  # (key, timestamp_ns, frame)
+        frame_1_data = self.latest_frames[1]
+        
+        key_0, ts_0, frame_0 = frame_0_data
+        key_1, ts_1, frame_1 = frame_1_data
+        
         if self.use_frame_count_sync:
-            # Match by frame count - find common frame counts
-            keys_0 = set(self.buffers[0].keys())
-            keys_1 = set(self.buffers[1].keys())
-            common_keys = keys_0 & keys_1
-            
-            if not common_keys:
+            # Match by frame count - only match if counts are equal
+            if key_0 != key_1:
+                # Frames don't match - keep waiting
+                # Discard the older one to stay fresh
+                if key_0 < key_1:
+                    self.latest_frames[0] = None  # Discard older frame from cam0
+                else:
+                    self.latest_frames[1] = None  # Discard older frame from cam1
                 return None
             
-            # Use lowest common key
-            match_key = min(common_keys)
-            ts_0, frame_0 = self.buffers[0].pop(match_key)
-            ts_1, frame_1 = self.buffers[1].pop(match_key)
+            # Matching frame counts - use these frames
+            self.latest_frames[0] = None
+            self.latest_frames[1] = None
             
             seq_id = self.sequence_counter
             self.sequence_counter += 1
@@ -481,34 +487,27 @@ class FrameSynchronizer:
             })
         else:
             # Match by timestamp proximity
-            ref_key = next(iter(self.buffers[0]))
-            ref_ts, ref_frame = self.buffers[0][ref_key]
+            diff_ms = abs(ts_0 - ts_1) / 1_000_000  # Convert ns to ms
             
-            # Find closest frame from camera 1
-            best_match_key = None
-            best_diff = float('inf')
-            
-            for key, (ts, frame) in self.buffers[1].items():
-                diff = abs(ts - ref_ts) / 1_000_000  # Convert to ms
-                if diff < best_diff:
-                    best_diff = diff
-                    best_match_key = key
-            
-            # Check if match is within threshold
-            if best_match_key is not None and best_diff <= self.max_time_diff_ms:
-                # Remove matched frames from buffers
-                _, frame_0 = self.buffers[0].pop(ref_key)
-                ts_1, frame_1 = self.buffers[1].pop(best_match_key)
+            if diff_ms <= self.max_time_diff_ms:
+                # Good match - use these frames
+                self.latest_frames[0] = None
+                self.latest_frames[1] = None
                 
                 seq_id = self.sequence_counter
                 self.sequence_counter += 1
                 
                 return (seq_id, {
-                    0: (ref_ts, frame_0),
+                    0: (ts_0, frame_0),
                     1: (ts_1, frame_1)
                 })
-            
-            return None
+            else:
+                # Frames too far apart - discard the older one and wait
+                if ts_0 < ts_1:
+                    self.latest_frames[0] = None  # Discard older frame from cam0
+                else:
+                    self.latest_frames[1] = None  # Discard older frame from cam1
+                return None
 
 
 # ============================================================================
@@ -518,7 +517,7 @@ class FrameSynchronizer:
 class GPUWorker:
     """Worker that processes frame pairs on a specific GPU."""
     
-    def __init__(self, gpu_id: int, worker_id: int, config: ServerConfig):
+    def __init__(self, gpu_id: int, worker_id: int, config: ServerConfig, on_available: Callable[['GPUWorker'], None] = None):
         self.gpu_id = gpu_id
         self.worker_id = worker_id
         self.config = config
@@ -531,6 +530,8 @@ class GPUWorker:
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.ready_event = threading.Event()  # Signals when models are loaded
+        self._on_available = on_available  # Callback when worker becomes available
+        self._is_processing = False  # Track if currently processing
         
     def start(self):
         """Start the worker thread."""
@@ -584,14 +585,18 @@ class GPUWorker:
         if self.config.verbose:
             print(f"[Worker {self.gpu_id}:{self.worker_id}] Initializing DepthSplat encoder on GPU {self.gpu_id}")
         
-        # Initialize DepthSplat encoder
-        self.encoder = DepthSplatInference()
+        # Initialize DepthSplat encoder - explicitly pass device to ensure correct GPU
+        self.encoder = DepthSplatInference(device=f"cuda:{self.gpu_id}")
         
         if self.config.verbose:
             print(f"[Worker {self.gpu_id}:{self.worker_id}] Both models ready")
         
         # Signal that we're ready
         self.ready_event.set()
+        
+        # Signal initial availability after models are loaded
+        if self._on_available:
+            self._on_available(self)
         
         while self.running:
             try:
@@ -608,12 +613,21 @@ class GPUWorker:
                     task = self.latest_task
                     self.latest_task = None
                     self.latest_task_event.clear()
+                    self._is_processing = True
                 
                 seq_id, frames_dict, result_callback, _cancel_callback = task
                 self._process_task(seq_id, frames_dict, result_callback)
                 
+                # Mark as available and signal pool
+                self._is_processing = False
+                if self._on_available:
+                    self._on_available(self)
+                
             except Exception as e:
                 print(f"[Worker {self.gpu_id}:{self.worker_id}] Error: {e}")
+                self._is_processing = False
+                if self._on_available:
+                    self._on_available(self)
                 
     def _process_task(self, seq_id: int, frames_dict: dict, result_callback: Callable):
         """Process a frame pair and invoke callback with result."""
@@ -738,6 +752,18 @@ class GPUWorkerPool:
         self.worker_index = 0
         self.lock = threading.Lock()
         
+        # Available worker tracking for pull-based model
+        self._available_workers: list[GPUWorker] = []
+        self._available_lock = threading.Lock()
+        self._available_event = threading.Event()  # Signals when a worker becomes available
+        
+    def _on_worker_available(self, worker: GPUWorker):
+        """Called when a worker becomes available for new work."""
+        with self._available_lock:
+            if worker not in self._available_workers:
+                self._available_workers.append(worker)
+        self._available_event.set()
+        
     def start(self):
         """Initialize and start all workers (non-blocking)."""
         # Determine available GPUs
@@ -753,7 +779,7 @@ class GPUWorkerPool:
         
         for gpu_id in gpu_ids:
             for worker_idx in range(self.config.workers_per_gpu):
-                worker = GPUWorker(gpu_id, worker_idx, self.config)
+                worker = GPUWorker(gpu_id, worker_idx, self.config, on_available=self._on_worker_available)
                 self.workers.append(worker)
                 worker.start()
         
@@ -793,9 +819,62 @@ class GPUWorkerPool:
         for worker in self.workers:
             worker.stop()
         print("Worker pool stopped")
+    
+    def wait_for_available_worker(self, timeout: float = None) -> Optional[GPUWorker]:
+        """
+        Wait for a worker to become available (pull-based model).
+        
+        This blocks until a worker finishes processing and is ready for new work.
+        Use this for lowest-latency streaming where you want to process only
+        the newest frame when a worker becomes free.
+        
+        Args:
+            timeout: Maximum time to wait in seconds (None = wait forever)
+            
+        Returns:
+            An available GPUWorker, or None if timeout occurred
+        """
+        start_time = time.time()
+        
+        while True:
+            # Check for available workers
+            with self._available_lock:
+                if self._available_workers:
+                    worker = self._available_workers.pop(0)
+                    # Clear event if no more workers available
+                    if not self._available_workers:
+                        self._available_event.clear()
+                    return worker
+            
+            # Calculate remaining timeout
+            if timeout is not None:
+                elapsed = time.time() - start_time
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    return None
+            else:
+                remaining = 1.0  # Use 1s polling interval when no timeout
+            
+            # Wait for availability signal
+            self._available_event.wait(timeout=min(remaining, 1.0))
+    
+    def submit_to_worker(self, worker: GPUWorker, seq_id: int, frames_dict: dict, 
+                         result_callback: Callable, cancel_callback: Callable = None):
+        """Submit a task to a specific worker (for pull-based model)."""
+        with self._available_lock:
+            # Remove from available list if present (shouldn't be, but just in case)
+            if worker in self._available_workers:
+                self._available_workers.remove(worker)
+        worker.submit((seq_id, frames_dict, result_callback, cancel_callback))
+    
+    def get_in_flight_count(self) -> int:
+        """Get number of frames currently being processed or waiting."""
+        with self._available_lock:
+            available_count = len(self._available_workers)
+        return len(self.workers) - available_count
         
     def submit(self, seq_id: int, frames_dict: dict, result_callback: Callable, cancel_callback: Callable = None):
-        """Submit a task to the next available worker (round-robin)."""
+        """Submit a task to the next available worker (round-robin - legacy push model)."""
         with self.lock:
             worker = self.workers[self.worker_index]
             self.worker_index = (self.worker_index + 1) % len(self.workers)
@@ -2020,7 +2099,14 @@ class WebRTCDepthSplatServer:
             elapsed = time.time() - self.start_time
             cam0_status = "✓" if self.cameras[0].connected else "✗"
             cam1_status = "✓" if self.cameras[1].connected else "✗"
-            print(f"[Status] Elapsed: {elapsed:.1f}s | Cameras: [{cam0_status}|{cam1_status}] | Queued: {self.frame_pairs_queued} | Processed: {self.frame_pairs_processed}")
+            
+            # Show actual in-flight count (pull model ensures this stays small)
+            in_flight = self.worker_pool.get_in_flight_count()
+            dropped = self.frame_pairs_queued - self.frame_pairs_processed - in_flight
+            if dropped < 0:
+                dropped = 0  # Can be negative briefly during transitions
+            
+            print(f"[Status] Elapsed: {elapsed:.1f}s | Cameras: [{cam0_status}|{cam1_status}] | InFlight: {in_flight} | Processed: {self.frame_pairs_processed} | Dropped: {dropped}")
             return True
         GLib.timeout_add(5000, report_status)
         
@@ -2127,25 +2213,44 @@ class WebRTCDepthSplatServer:
             self.latest_frame_event.set()
     
     def _process_loop(self):
-        """Process the latest frame pair when available."""
+        """
+        Process the latest frame pair using pull-based model.
+        
+        This waits for a worker to become available FIRST, then grabs the latest
+        frame. This ensures we always process the freshest possible frame and
+        keeps queue depth = num_workers (like RTMP/SRT low-latency modes).
+        """
         while self.running:
-            # Wait for a new frame to be available
-            if not self.latest_frame_event.wait(timeout=1.0):
+            # PULL MODEL: Wait for a worker to become available first
+            # This ensures queue depth never exceeds num_workers
+            worker = self.worker_pool.wait_for_available_worker(timeout=1.0)
+            if worker is None:
                 continue  # Timeout, check if still running
             
-            # Grab the latest frame atomically
-            with self.latest_frame_lock:
-                if self.latest_frame is None:
-                    self.latest_frame_event.clear()
-                    continue
-                    
-                seq_id, frames_dict = self.latest_frame
-                self.latest_frame = None  # Clear it
-                self.latest_frame_event.clear()
+            if not self.running:
+                break
             
-            # Mark as submitted for correct output ordering, then submit to worker
+            # Now that we have an available worker, get the latest frame
+            # Wait for a frame if none available yet
+            while self.running:
+                with self.latest_frame_lock:
+                    if self.latest_frame is not None:
+                        seq_id, frames_dict = self.latest_frame
+                        self.latest_frame = None
+                        self.latest_frame_event.clear()
+                        break
+                
+                # No frame yet, wait for one
+                if not self.latest_frame_event.wait(timeout=0.5):
+                    continue
+            else:
+                # Server stopped
+                break
+            
+            # Mark as submitted for correct output ordering, then submit to specific worker
             self.output_sequencer.mark_submitted(seq_id)
-            self.worker_pool.submit(
+            self.worker_pool.submit_to_worker(
+                worker,
                 seq_id,
                 frames_dict,
                 self.output_sequencer.add_result,
@@ -2293,7 +2398,14 @@ class DepthSplatServer:
                 frames = cam.frame_count
                 cam_states.append(f"cam{cam.camera_id}:{state}({frames}f)")
             states_str = " | ".join(cam_states)
-            print(f"[Status] Elapsed: {elapsed:.1f}s | Queued: {self.frame_pairs_queued} | Processed: {self.frame_pairs_processed} | {states_str}")
+            
+            # Show actual in-flight count (pull model ensures this stays small)
+            in_flight = self.worker_pool.get_in_flight_count()
+            dropped = self.frame_pairs_queued - self.frame_pairs_processed - in_flight
+            if dropped < 0:
+                dropped = 0  # Can be negative briefly during transitions
+            
+            print(f"[Status] Elapsed: {elapsed:.1f}s | InFlight: {in_flight} | Processed: {self.frame_pairs_processed} | Dropped: {dropped} | {states_str}")
             return True  # Repeat
         GLib.timeout_add(5000, report_status)  # Report every 5 seconds
         
@@ -2382,29 +2494,48 @@ class DepthSplatServer:
                 print(f"[Limit] Queued {self.config.max_frame_pairs} frame pairs, waiting for processing...")
                     
     def _process_loop(self):
-        """Process the latest frame pair when available."""
+        """
+        Process the latest frame pair using pull-based model.
+        
+        This waits for a worker to become available FIRST, then grabs the latest
+        frame. This ensures we always process the freshest possible frame and
+        keeps queue depth = num_workers (like RTMP/SRT low-latency modes).
+        """
         while self.running:
-            # Wait for a new frame to be available
-            if not self.latest_frame_event.wait(timeout=1.0):
+            # PULL MODEL: Wait for a worker to become available first
+            # This ensures queue depth never exceeds num_workers
+            worker = self.worker_pool.wait_for_available_worker(timeout=1.0)
+            if worker is None:
                 continue  # Timeout, check if still running
             
-            # Grab the latest frame atomically
-            with self.latest_frame_lock:
-                if self.latest_frame is None:
-                    self.latest_frame_event.clear()
+            if not self.running:
+                break
+            
+            # Now that we have an available worker, get the latest frame
+            # Wait for a frame if none available yet
+            while self.running:
+                with self.latest_frame_lock:
+                    if self.latest_frame is not None:
+                        seq_id, frames_dict = self.latest_frame
+                        self.latest_frame = None
+                        self.latest_frame_event.clear()
+                        break
+                
+                # No frame yet, wait for one
+                if not self.latest_frame_event.wait(timeout=0.5):
                     continue
-                    
-                seq_id, frames_dict = self.latest_frame
-                self.latest_frame = None  # Clear it
-                self.latest_frame_event.clear()
+            else:
+                # Server stopped
+                break
             
             # Save input frames if debugging
             if self.config.save_input_frames:
                 self._save_debug_frames(seq_id, frames_dict)
             
-            # Mark as submitted for correct output ordering, then submit to worker
+            # Mark as submitted for correct output ordering, then submit to specific worker
             self.output_sequencer.mark_submitted(seq_id)
-            self.worker_pool.submit(
+            self.worker_pool.submit_to_worker(
+                worker,
                 seq_id,
                 frames_dict,
                 self.output_sequencer.add_result,
