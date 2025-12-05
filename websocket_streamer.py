@@ -235,7 +235,13 @@ class WebSocketStreamer:
             seq_id: Sequence ID of the frame
             output_bytes: Gaussian splat data (SPZ or PLY bytes)
         """
-        if not self._running or self._loop is None:
+        if not self._running:
+            if self.verbose:
+                logger.warning(f"broadcast_frame called but not running")
+            return
+        if self._loop is None:
+            if self.verbose:
+                logger.warning(f"broadcast_frame called but loop is None")
             return
             
         # Build the binary message with header
@@ -401,6 +407,8 @@ class WebSocketStreamer:
             clients = list(self._clients)
             
         if not clients:
+            if self.verbose:
+                logger.debug(f"[WS] No clients connected, skipping seq {seq_id}")
             return
             
         # Update stats

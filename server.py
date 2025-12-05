@@ -724,6 +724,9 @@ class GPUWorker:
             print(f"[Worker {self.gpu_id}:{self.worker_id}] Failed to process seq {seq_id}: {e}")
             import traceback
             traceback.print_exc()
+            # Notify sequencer of failure so it doesn't block on this seq
+            # Pass None as output_bytes to indicate failure
+            result_callback(seq_id, None)
 
 
 class GPUWorkerPool:
@@ -878,6 +881,11 @@ class OutputSequencer:
             seq_id = self.in_flight.pop(0)
             output_bytes = self.results_buffer.pop(seq_id)
             
+            # Handle failed sequences (None output_bytes)
+            if output_bytes is None:
+                print(f"[Output] Seq {seq_id} failed, skipping")
+                continue
+            
             size_mb = len(output_bytes) / (1024 * 1024)
             
             # Emit via callback (e.g., WebSocket streaming)
@@ -900,7 +908,6 @@ class OutputSequencer:
                     print(f"[Output] Saved seq {seq_id} to {output_path} ({size_mb:.2f} MB)")
             
             self.total_emitted += 1
-            
             
             # Notify completion callback
             if self.on_complete:
