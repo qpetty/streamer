@@ -57,6 +57,12 @@ Usage:
     # SRT streams (listener mode - iOS devices send to server):
     python server.py --mode srt --srt-listen
     
+    # TCP H.264 streams (listener mode - wait for raw H.264 senders):
+    python server.py --mode tcp --tcp-listen
+    
+    # TCP H.264 streams (client mode - connect to senders):
+    python server.py --mode tcp --tcp0 192.168.1.100:5000 --tcp1 192.168.1.100:5001
+    
     # WebRTC mode (receive streams from browsers/mobile apps):
     python server.py --mode webrtc --webrtc-port 8080
     
@@ -138,6 +144,8 @@ from typing import Optional, Callable, Dict, Any
 from collections import OrderedDict
 import io
 from PIL import Image
+
+os.environ["HF_HOME"] = "/root/.cache"
 
 # ============================================================================
 # Import DepthSplat inference from ../depthsplat
@@ -433,11 +441,6 @@ class FrameSynchronizer:
                 
             self.buffers[camera_id][key] = (timestamp_ns, frame)
             
-            # Debug: Log buffer status periodically
-            total_in_buffers = sum(len(self.buffers[i]) for i in range(self.num_cameras))
-            if total_in_buffers == 1 or total_in_buffers % 10 == 0:
-                buffer_sizes = [len(self.buffers[i]) for i in range(self.num_cameras)]
-                print(f"[Sync] Camera {camera_id} added frame. Buffer sizes: {buffer_sizes}")
             
             # Try to find a matching pair
             result = self._try_match()
@@ -562,8 +565,6 @@ class GPUWorker:
                 # Call cancel callback for the replaced task
                 if len(old_task) > 3 and old_task[3] is not None:
                     old_task[3](old_seq_id)  # cancel_callback(old_seq_id)
-                if self.config.verbose:
-                    print(f"[Worker {self.gpu_id}:{self.worker_id}] Task {seq_id} replaced pending task {old_seq_id}")
         self.latest_task_event.set()
         
     def _run(self):
@@ -644,8 +645,6 @@ class GPUWorker:
                 if self.config.verbose:
                     print(f"[Worker {self.gpu_id}:{self.worker_id}] Saved input frames to {path_0} and {path_1}")
             
-            if self.config.verbose:
-                print(f"[Worker {self.gpu_id}:{self.worker_id}] Running DepthAnything3 on seq {seq_id}")
             
             # Run DepthAnything3 to get intrinsics and extrinsics (W2C)
             # Pass numpy arrays directly - DepthAnything3 accepts HWC uint8 arrays
@@ -657,8 +656,6 @@ class GPUWorker:
             )
             da3_elapsed = time.time() - da3_start
             
-            if self.config.verbose:
-                print(f"[Worker {self.gpu_id}:{self.worker_id}] DepthAnything3 took {da3_elapsed:.3f}s")
             
             # Get processed image size from DepthAnything3 for intrinsics scaling
             processed_height, processed_width = prediction.processed_images.shape[1:3]
@@ -678,8 +675,6 @@ class GPUWorker:
                 to_height=orig_height,
             )
             
-            if self.config.verbose:
-                print(f"[Worker {self.gpu_id}:{self.worker_id}] Intrinsics scaled from {processed_width}x{processed_height} to {orig_width}x{orig_height}")
             
             # Convert frames to tensors for DepthSplat - use ORIGINAL images, not processed
             # Convert from HWC uint8 to CHW float [0, 1]
@@ -695,8 +690,6 @@ class GPUWorker:
                 (orig_width, orig_height),
             ]
             
-            if self.config.verbose:
-                print(f"[Worker {self.gpu_id}:{self.worker_id}] Running DepthSplat encoder on seq {seq_id}")
             
             # Run DepthSplat encoder inference
             encoder_start = time.time()
@@ -722,7 +715,7 @@ class GPUWorker:
             total_elapsed = time.time() - start_time
             
             if self.config.verbose:
-                print(f"[Worker {self.gpu_id}:{self.worker_id}] Encoder took {encoder_elapsed:.3f}s, total {total_elapsed:.3f}s for seq {seq_id}")
+                print(f"[Worker {self.gpu_id}:{self.worker_id}] Seq {seq_id} completed in {total_elapsed:.2f}s")
             
             # Invoke callback with result
             result_callback(seq_id, output_bytes)
@@ -854,8 +847,6 @@ class OutputSequencer:
         """
         with self.lock:
             self.in_flight.append(seq_id)
-            if self.config.verbose:
-                print(f"[Sequencer] Submitted seq {seq_id}, in-flight count: {len(self.in_flight)}")
     
     def cancel_submitted(self, seq_id: int):
         """
@@ -865,8 +856,6 @@ class OutputSequencer:
         with self.lock:
             if seq_id in self.in_flight:
                 self.in_flight.remove(seq_id)
-                if self.config.verbose:
-                    print(f"[Sequencer] Cancelled seq {seq_id}, in-flight count: {len(self.in_flight)}")
         
     def add_result(self, seq_id: int, output_bytes: bytes):
         """
@@ -912,8 +901,6 @@ class OutputSequencer:
             
             self.total_emitted += 1
             
-            if self.config.verbose:
-                print(f"[Output] Emitted seq {seq_id}, total emitted: {self.total_emitted}")
             
             # Notify completion callback
             if self.on_complete:
@@ -957,15 +944,15 @@ class CameraPipeline:
         height = self.config.input_height
         framerate = self.config.input_framerate
         
+        # Note: videorate removed because it blocks when input has no timestamps (pts=none)
+        # The pipeline still works without it - we just accept whatever framerate comes in
         pipeline = (
             f"{self.source_pipeline} ! "
             f"videoscale method=4 ! "  # method=4 is Lanczos (highest quality)
             f"video/x-raw,width={width},height={height} ! "
-            f"videorate ! "
-            f"video/x-raw,framerate={framerate}/1 ! "
             f"videoconvert ! "
             f"video/x-raw,format=RGB ! "
-            f"appsink name=sink emit-signals=true max-buffers=2 drop=true"
+            f"appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false"
         )
         return pipeline
         
@@ -985,7 +972,6 @@ class CameraPipeline:
         bus.connect("message::warning", self._on_bus_warning)
         bus.connect("message::state-changed", self._on_state_changed)
         bus.connect("message::eos", self._on_eos)
-        
         # Connect appsink signal
         appsink = self.pipeline.get_by_name("sink")
         appsink.connect("new-sample", self._on_new_sample)
@@ -993,7 +979,21 @@ class CameraPipeline:
         # Start pipeline
         ret = self.pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
+            # Try to get more error details from the bus
+            bus = self.pipeline.get_bus()
+            if bus:
+                msg = bus.pop_filtered(Gst.MessageType.ERROR)
+                if msg:
+                    err, debug = msg.parse_error()
+                    raise RuntimeError(
+                        f"Failed to start camera {self.camera_id} pipeline: {err.message}\n"
+                        f"Debug info: {debug}"
+                    )
             raise RuntimeError(f"Failed to start camera {self.camera_id} pipeline")
+        elif ret == Gst.StateChangeReturn.ASYNC:
+            # For sources like tcpserversrc, the state change is async (waiting for connection)
+            if self.config.verbose:
+                print(f"[Camera {self.camera_id}] Waiting for connection...")
         
         if self.config.verbose:
             print(f"[Camera {self.camera_id}] Started")
@@ -1020,6 +1020,13 @@ class CameraPipeline:
     def _on_eos(self, bus, message):
         """Handle end of stream."""
         print(f"[Camera {self.camera_id}] End of stream")
+    
+    def get_pipeline_state(self) -> str:
+        """Get current pipeline state as string."""
+        if self.pipeline:
+            ret, state, pending = self.pipeline.get_state(0)
+            return f"{state.value_nick}" + (f" (pending: {pending.value_nick})" if pending != Gst.State.VOID_PENDING else "")
+        return "no pipeline"
             
     def stop(self):
         """Stop the camera pipeline."""
@@ -1037,9 +1044,6 @@ class CameraPipeline:
         # Apply frame skip
         self.frame_count += 1
         
-        # Debug: Log frame arrival (every 30 frames to avoid spam)
-        if self.frame_count == 1 or self.frame_count % 30 == 0:
-            print(f"[Camera {self.camera_id}] Received frame {self.frame_count}")
         
         if self.config.frame_skip > 1:
             if (self.frame_count - 1) % self.config.frame_skip != 0:
@@ -1047,7 +1051,12 @@ class CameraPipeline:
         
         # Get buffer and timestamp
         buffer = sample.get_buffer()
-        timestamp_ns = buffer.pts if buffer.pts != Gst.CLOCK_TIME_NONE else time.time_ns()
+        # For timestamp sync, always use wall-clock time for better cross-stream sync
+        # PTS timestamps are stream-relative and won't match between cameras that start at different times
+        if self.config.use_frame_count_sync:
+            timestamp_ns = buffer.pts if buffer.pts != Gst.CLOCK_TIME_NONE else time.time_ns()
+        else:
+            timestamp_ns = time.time_ns()
         
         # Extract frame data
         caps = sample.get_caps()
@@ -2106,11 +2115,6 @@ class WebRTCDepthSplatServer:
                 self.latest_frame = (proc_seq_id, frames_dict)
                 self.frame_pairs_queued += 1
                 
-                if self.config.verbose:
-                    if old_frame is not None:
-                        print(f"[Latest] Frame pair {proc_seq_id} replaced {old_frame[0]} (sync_seq={sync_seq_id})")
-                    else:
-                        print(f"[Latest] Frame pair {proc_seq_id} ready (sync_seq={sync_seq_id})")
             
             # Signal that a new frame is available
             self.latest_frame_event.set()
@@ -2275,7 +2279,14 @@ class DepthSplatServer:
             if not self.running:
                 return False
             elapsed = time.time() - self.start_time
-            print(f"[Status] Elapsed: {elapsed:.1f}s | Queued: {self.frame_pairs_queued} | Processed: {self.frame_pairs_processed}")
+            # Get pipeline states
+            cam_states = []
+            for cam in self.cameras:
+                state = cam.get_pipeline_state()
+                frames = cam.frame_count
+                cam_states.append(f"cam{cam.camera_id}:{state}({frames}f)")
+            states_str = " | ".join(cam_states)
+            print(f"[Status] Elapsed: {elapsed:.1f}s | Queued: {self.frame_pairs_queued} | Processed: {self.frame_pairs_processed} | {states_str}")
             return True  # Repeat
         GLib.timeout_add(5000, report_status)  # Report every 5 seconds
         
@@ -2355,11 +2366,6 @@ class DepthSplatServer:
                 self.latest_frame = (proc_seq_id, frames_dict)
                 self.frame_pairs_queued += 1
                 
-                if self.config.verbose:
-                    if old_frame is not None:
-                        print(f"[Latest] Frame pair {proc_seq_id} replaced {old_frame[0]} (sync_seq={sync_seq_id})")
-                    else:
-                        print(f"[Latest] Frame pair {proc_seq_id} ready (sync_seq={sync_seq_id})")
             
             # Signal that a new frame is available
             self.latest_frame_event.set()
@@ -2855,6 +2861,89 @@ def create_webrtc_config(
     )
 
 
+def create_tcp_h264_config(
+    host_0: str = "0.0.0.0",
+    port_0: int = 5000,
+    host_1: str = "0.0.0.0",
+    port_1: int = 5001,
+    listen: bool = True,
+    stream_format: str = "auto",
+) -> ServerConfig:
+    """
+    Create a configuration for H.264 video over TCP streams.
+    
+    This mode receives H.264 video streams over TCP connections.
+    Each camera requires a separate TCP connection on a different port.
+    
+    Args:
+        host_0: Host address for camera 0 (IP to bind/connect)
+        port_0: TCP port for camera 0
+        host_1: Host address for camera 1 (IP to bind/connect)
+        port_1: TCP port for camera 1
+        listen: If True, use tcpserversrc (listen for connections).
+                If False, use tcpclientsrc (connect to sender).
+        stream_format: Container/stream format:
+            - "auto": Auto-detect using decodebin (default, most flexible)
+            - "h264": Raw H.264 Annex B bitstream (NAL units with start codes)
+            - "ts" or "mpegts": MPEG-TS container (common for streaming)
+            - "flv": FLV container
+                
+    Note:
+        - In listener mode (listen=True), the server waits for senders to connect.
+          Good for mobile devices that initiate connections.
+        - In client mode (listen=False), the server connects to senders.
+          Good when senders have known addresses.
+          
+    Sender Examples (sending H.264 to this server):
+        # Raw H.264 (--tcp-format h264):
+        ffmpeg -i input.mp4 -c:v libx264 -tune zerolatency -f h264 tcp://server_ip:5000
+        
+        # MPEG-TS format (--tcp-format ts) - recommended for streaming:
+        ffmpeg -i input.mp4 -c:v libx264 -tune zerolatency -f mpegts tcp://server_ip:5000
+        
+        # From GStreamer (raw H.264):
+        gst-launch-1.0 videotestsrc ! x264enc tune=zerolatency ! tcpclientsink host=server_ip port=5000
+        
+        # From GStreamer (MPEG-TS):
+        gst-launch-1.0 videotestsrc ! x264enc tune=zerolatency ! mpegtsmux ! tcpclientsink host=server_ip port=5000
+    """
+    # Build decoder pipeline based on format
+    if stream_format == "h264" or stream_format == "raw":
+        # Raw H.264 Annex B bitstream
+        decoder = "h264parse ! avdec_h264 ! videoconvert"
+    elif stream_format == "ts" or stream_format == "mpegts":
+        # MPEG-TS container
+        decoder = "tsdemux ! h264parse ! avdec_h264 ! videoconvert"
+    elif stream_format == "flv":
+        # FLV container
+        decoder = "flvdemux ! h264parse ! avdec_h264 ! videoconvert"
+    else:  # "auto" or anything else
+        # Auto-detect using decodebin
+        decoder = "decodebin ! videoconvert"
+    
+    if listen:
+        # Server mode - listen for incoming connections
+        # do-timestamp=true: Generate timestamps for incoming data
+        source_0 = f"tcpserversrc host={host_0} port={port_0} do-timestamp=true ! queue ! {decoder}"
+        source_1 = f"tcpserversrc host={host_1} port={port_1} do-timestamp=true ! queue ! {decoder}"
+    else:
+        # Client mode - connect to senders
+        source_0 = f"tcpclientsrc host={host_0} port={port_0} do-timestamp=true ! queue ! {decoder}"
+        source_1 = f"tcpclientsrc host={host_1} port={port_1} do-timestamp=true ! queue ! {decoder}"
+    
+    return ServerConfig(
+        camera_0_source=source_0,
+        camera_1_source=source_1,
+        input_width=1920,
+        input_height=1080,
+        input_framerate=30,
+        frame_skip=2,
+        max_fps=15.0,
+        use_frame_count_sync=False,  # Use timestamp sync - TCP streams have valid timestamps after first frame
+        verbose=True,
+    )
+
+
 def generate_self_signed_cert(
     ssl_dir: str = "/workspace/ssl",
     cert_name: str = "cert.pem",
@@ -2965,6 +3054,21 @@ Examples:
   # SRT streams (caller mode - connect to senders):
   python server.py --mode srt --srt0 srt://192.168.1.100:8080 --srt1 srt://192.168.1.100:8081
   
+  # TCP H.264 streams (listener mode - wait for senders to connect):
+  python server.py --mode tcp --tcp-listen
+  
+  # TCP H.264 with MPEG-TS format (recommended for streaming):
+  python server.py --mode tcp --tcp-listen --tcp-format ts
+  
+  # TCP H.264 with raw H.264 format:
+  python server.py --mode tcp --tcp-listen --tcp-format h264
+  
+  # TCP H.264 streams (listener mode - custom ports):
+  python server.py --mode tcp --tcp-listen 6000,6001
+  
+  # TCP H.264 streams (client mode - connect to senders):
+  python server.py --mode tcp --tcp0 192.168.1.100:5000 --tcp1 192.168.1.100:5001
+  
   # WebRTC mode - receive streams from browsers/mobile apps:
   python server.py --mode webrtc --webrtc-port 8080
   
@@ -2980,7 +3084,7 @@ Examples:
     )
     parser.add_argument(
         "--mode",
-        choices=["test", "file", "v4l2", "rtsp", "rtmp", "srt", "webrtc", "custom"],
+        choices=["test", "file", "v4l2", "rtsp", "rtmp", "srt", "tcp", "webrtc", "custom"],
         default="file",
         help="Camera mode (default: file)"
     )
@@ -3029,6 +3133,29 @@ Examples:
         const="8080,8081",
         metavar="PORT0,PORT1",
         help="SRT listener mode: wait for connections on specified ports (default: 8080,8081)"
+    )
+    
+    # TCP H.264 mode arguments
+    parser.add_argument(
+        "--tcp0",
+        help="TCP address for camera 0 in client mode (e.g., 192.168.1.100:5000)"
+    )
+    parser.add_argument(
+        "--tcp1",
+        help="TCP address for camera 1 in client mode (e.g., 192.168.1.100:5001)"
+    )
+    parser.add_argument(
+        "--tcp-listen",
+        nargs="?",
+        const="5000,5001",
+        metavar="PORT0,PORT1",
+        help="TCP listener mode: wait for H.264 streams on specified ports (default: 5000,5001)"
+    )
+    parser.add_argument(
+        "--tcp-format",
+        choices=["auto", "h264", "ts", "mpegts", "flv"],
+        default="auto",
+        help="TCP stream format: auto (default), h264 (raw Annex B), ts/mpegts (MPEG-TS container), flv"
     )
     parser.add_argument(
         "--frame-skip",
@@ -3356,6 +3483,84 @@ Examples:
             print(f"   srt://{local_ip}:{port0}")
             print(f"\n📱 Camera 1 (iOS device 2) should connect to:")
             print(f"   srt://{local_ip}:{port1}")
+            print("\n" + "="*70 + "\n")
+    elif args.mode == "tcp":
+        # Handle --tcp-listen shorthand for listener mode
+        listen_mode = False
+        if args.tcp_listen:
+            listen_mode = True
+            ports = args.tcp_listen.split(",")
+            port0 = int(ports[0].strip()) if len(ports) > 0 else 5000
+            port1 = int(ports[1].strip()) if len(ports) > 1 else 5001
+            host0 = "0.0.0.0"
+            host1 = "0.0.0.0"
+        elif args.tcp0 and args.tcp1:
+            # Client mode - parse host:port
+            def parse_tcp_addr(addr):
+                if ":" in addr:
+                    h, p = addr.rsplit(":", 1)
+                    return h, int(p)
+                else:
+                    return addr, 5000
+            host0, port0 = parse_tcp_addr(args.tcp0)
+            host1, port1 = parse_tcp_addr(args.tcp1)
+        else:
+            parser.error("TCP mode requires --tcp0 and --tcp1 addresses, or use --tcp-listen for listener mode")
+        
+        config = create_tcp_h264_config(
+            host_0=host0,
+            port_0=port0,
+            host_1=host1,
+            port_1=port1,
+            listen=listen_mode,
+            stream_format=args.tcp_format,
+        )
+        
+        # Print connection info for TCP listener mode
+        if listen_mode:
+            import socket
+            try:
+                # Get actual IP address (not just hostname)
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+            except:
+                local_ip = "YOUR_SERVER_IP"
+            
+            # Determine FFmpeg output format based on stream_format
+            fmt = args.tcp_format
+            if fmt == "ts" or fmt == "mpegts":
+                ffmpeg_fmt = "mpegts"
+                fmt_desc = "MPEG-TS"
+            elif fmt == "flv":
+                ffmpeg_fmt = "flv"
+                fmt_desc = "FLV"
+            elif fmt == "h264":
+                ffmpeg_fmt = "h264"
+                fmt_desc = "Raw H.264"
+            else:
+                ffmpeg_fmt = "mpegts"  # Recommend MPEG-TS for auto mode
+                fmt_desc = "Auto-detect (recommend MPEG-TS)"
+            
+            print("\n" + "="*70)
+            print(f"TCP H.264 LISTENER MODE - Format: {fmt_desc}")
+            print("="*70)
+            print(f"\n📹 Camera 0 - connect to: tcp://{local_ip}:{port0}")
+            print(f"📹 Camera 1 - connect to: tcp://{local_ip}:{port1}")
+            print(f"\n--- Sender Examples (FFmpeg) ---")
+            print(f"\n# Camera 0 - from webcam (macOS):")
+            print(f"ffmpeg -f avfoundation -framerate 30 -i \"0\" \\")
+            print(f"  -c:v libx264 -preset ultrafast -tune zerolatency \\")
+            print(f"  -f {ffmpeg_fmt} tcp://{local_ip}:{port0}")
+            print(f"\n# Camera 0 - from webcam (Linux):")
+            print(f"ffmpeg -f v4l2 -framerate 30 -i /dev/video0 \\")
+            print(f"  -c:v libx264 -preset ultrafast -tune zerolatency \\")
+            print(f"  -f {ffmpeg_fmt} tcp://{local_ip}:{port0}")
+            print(f"\n# Camera 1 - from file (for testing):")
+            print(f"ffmpeg -re -stream_loop -1 -i video.mp4 \\")
+            print(f"  -c:v libx264 -preset ultrafast -tune zerolatency \\")
+            print(f"  -f {ffmpeg_fmt} tcp://{local_ip}:{port1}")
             print("\n" + "="*70 + "\n")
     else:
         config = ServerConfig()
