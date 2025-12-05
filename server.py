@@ -668,6 +668,9 @@ class GPUWorker:
                 process_res=self.config.depth_anything_process_res,
                 process_res_method="upper_bound_resize",
             )
+            # Synchronize CUDA operations on this GPU before using the results
+            # This ensures all GPU operations complete before we access the outputs
+            torch.cuda.synchronize(self.gpu_id)
             da3_elapsed = time.time() - da3_start
             
             
