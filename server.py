@@ -254,6 +254,15 @@ class ServerConfig:
     # Output format: "spz" (compressed, ~10x smaller) or "ply" (standard)
     output_format: str = "spz"
     
+    # Directory to capture raw input frames (when set, frames are written here)
+    capture_dir: Optional[str] = None
+    
+    # When True, only capture frames to disk (no inference)
+    capture_only: bool = False
+    
+    # Image format for captured frames
+    capture_format: str = "png"
+    
     # Callback for output (called in addition to file saving if save_files=True)
     # Signature: callback(sequence_id: int, output_bytes: bytes)
     output_callback: Optional[Callable[[int, bytes], None]] = None
@@ -931,6 +940,54 @@ class OutputSequencer:
             if self.on_complete:
                 self.on_complete(self.total_emitted)
 
+
+# ============================================================================
+# Frame Capture Writer
+# ============================================================================
+
+
+class FrameCaptureWriter:
+    """Persist synchronized frame pairs to disk for later replay."""
+    
+    def __init__(self, base_dir: str, fmt: str = "png", verbose: bool = True):
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.fmt = fmt
+        self.verbose = verbose
+        self.lock = threading.Lock()
+    
+    def save_pair(self, seq_id: int, frames_dict: dict):
+        """
+        Save a synchronized frame pair.
+        
+        Args:
+            seq_id: Sequential id for the pair
+            frames_dict: {camera_id: (timestamp_ns, frame_array)}
+        """
+        with self.lock:
+            metadata = {
+                "seq_id": int(seq_id),
+                "cameras": {}
+            }
+            
+            for cam_id, (timestamp_ns, frame) in sorted(frames_dict.items()):
+                img = Image.fromarray(frame)
+                filename = f"seq_{seq_id:06d}_cam{cam_id}.{self.fmt}"
+                img_path = self.base_dir / filename
+                img.save(img_path)
+                
+                metadata["cameras"][str(cam_id)] = {
+                    "timestamp_ns": int(timestamp_ns),
+                    "path": filename,
+                    "shape": [int(dim) for dim in frame.shape],
+                }
+            
+            meta_path = self.base_dir / f"seq_{seq_id:06d}_meta.json"
+            with open(meta_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+            
+            if self.verbose:
+                print(f"[Capture] Saved seq {seq_id} -> {self.base_dir}")
 
 # ============================================================================
 # GStreamer Camera Pipeline
@@ -1921,6 +1978,12 @@ class WebRTCDepthSplatServer:
         self.web_client_server: Optional[WebClientServer] = None
         self.main_loop: Optional[GLib.MainLoop] = None
         self.running = False
+        self.capture_writer: Optional[FrameCaptureWriter] = (
+            FrameCaptureWriter(config.capture_dir, fmt=config.capture_format, verbose=config.verbose)
+            if config.capture_dir
+            else None
+        )
+        self.capture_saved = 0
         
         # Rate limiting
         self.last_process_time = 0.0
@@ -1970,30 +2033,36 @@ class WebRTCDepthSplatServer:
             save_files=self.config.save_files,
         )
         
-        # Initialize GPU workers
-        self.worker_pool = GPUWorkerPool(self.config)
-        self.worker_pool.start()
-        
-        print("\n" + "="*70)
-        print("Waiting for encoder initialization...")
-        print("="*70)
-        if not self.worker_pool.wait_all_ready(timeout=300):
-            print("ERROR: Workers failed to initialize within timeout")
-            return
-        print("="*70 + "\n")
-        
-        # Start result listener to feed OutputSequencer
-        self.worker_pool.start_result_listener(self.output_sequencer.add_result)
-        
-        # Start processing thread
-        self.running = True
-        self.start_time = time.time()
-        self.process_thread = threading.Thread(
-            target=self._process_loop,
-            name="ProcessLoop",
-            daemon=True
-        )
-        self.process_thread.start()
+        if not self.config.capture_only:
+            # Initialize GPU workers
+            self.worker_pool = GPUWorkerPool(self.config)
+            self.worker_pool.start()
+            
+            print("\n" + "="*70)
+            print("Waiting for encoder initialization...")
+            print("="*70)
+            if not self.worker_pool.wait_all_ready(timeout=300):
+                print("ERROR: Workers failed to initialize within timeout")
+                return
+            print("="*70 + "\n")
+            
+            # Start result listener to feed OutputSequencer
+            self.worker_pool.start_result_listener(self.output_sequencer.add_result)
+            
+            # Start processing thread
+            self.running = True
+            self.start_time = time.time()
+            self.process_thread = threading.Thread(
+                target=self._process_loop,
+                name="ProcessLoop",
+                daemon=True
+            )
+            self.process_thread.start()
+        else:
+            # Capture-only: skip worker pool and processing thread
+            self.worker_pool = None
+            self.running = True
+            self.start_time = time.time()
         
         # Create WebRTC camera pipelines
         self.cameras = {
@@ -2043,7 +2112,7 @@ class WebRTCDepthSplatServer:
             cam1_status = "✓" if self.cameras[1].connected else "✗"
             
             # Show actual in-flight count (pull model ensures this stays small)
-            in_flight = self.worker_pool.get_in_flight_count()
+            in_flight = self.worker_pool.get_in_flight_count() if self.worker_pool else 0
             dropped = self.frame_pairs_queued - self.frame_pairs_processed - in_flight
             if dropped < 0:
                 dropped = 0  # Can be negative briefly during transitions
@@ -2144,6 +2213,16 @@ class WebRTCDepthSplatServer:
                 proc_seq_id = self.processing_seq_counter
                 self.processing_seq_counter += 1
             
+            # Optional capture to disk
+            if self.capture_writer:
+                self.capture_writer.save_pair(proc_seq_id, frames_dict)
+                self.capture_saved += 1
+                if self.config.capture_only:
+                    if self.config.max_frame_pairs > 0 and self.capture_saved >= self.config.max_frame_pairs:
+                        print(f"[Capture] Reached limit of {self.config.max_frame_pairs} pairs, stopping...")
+                        self._request_stop()
+                    return
+            
             # Store as latest frame (overwrites any previous unprocessed frame)
             with self.latest_frame_lock:
                 old_frame = self.latest_frame
@@ -2224,6 +2303,12 @@ class DepthSplatServer:
         self.cameras: list[CameraPipeline] = []
         self.main_loop: Optional[GLib.MainLoop] = None
         self.running = False
+        self.capture_writer: Optional[FrameCaptureWriter] = (
+            FrameCaptureWriter(config.capture_dir, fmt=config.capture_format, verbose=config.verbose)
+            if config.capture_dir
+            else None
+        )
+        self.capture_saved = 0
         
         # Rate limiting
         self.last_process_time = 0.0
@@ -2270,36 +2355,43 @@ class DepthSplatServer:
                 print(f"\n[Complete] Processed {total_emitted} frame pairs")
                 self._request_stop()
         
-        self.output_sequencer = OutputSequencer(
-            self.config,
-            on_complete=on_output_complete,
-            save_files=self.config.save_files,
-        )
-        self.worker_pool = GPUWorkerPool(self.config)
-        self.worker_pool.start()
-        
-        # IMPORTANT: Wait for all workers to be ready before starting cameras
-        # This ensures the encoder is fully loaded before we accept any frames
-        print("\n" + "="*70)
-        print("Waiting for encoder initialization...")
-        print("="*70)
-        if not self.worker_pool.wait_all_ready(timeout=300):  # 5 minute timeout
-            print("ERROR: Workers failed to initialize within timeout")
-            return
-        print("="*70 + "\n")
-        
-        # Start result listener to feed OutputSequencer
-        self.worker_pool.start_result_listener(self.output_sequencer.add_result)
-        
-        # Start processing thread
-        self.running = True
-        self.start_time = time.time()
-        self.process_thread = threading.Thread(
-            target=self._process_loop,
-            name="ProcessLoop",
-            daemon=True
-        )
-        self.process_thread.start()
+        if not self.config.capture_only:
+            self.output_sequencer = OutputSequencer(
+                self.config,
+                on_complete=on_output_complete,
+                save_files=self.config.save_files,
+            )
+            self.worker_pool = GPUWorkerPool(self.config)
+            self.worker_pool.start()
+            
+            # IMPORTANT: Wait for all workers to be ready before starting cameras
+            # This ensures the encoder is fully loaded before we accept any frames
+            print("\n" + "="*70)
+            print("Waiting for encoder initialization...")
+            print("="*70)
+            if not self.worker_pool.wait_all_ready(timeout=300):  # 5 minute timeout
+                print("ERROR: Workers failed to initialize within timeout")
+                return
+            print("="*70 + "\n")
+            
+            # Start result listener to feed OutputSequencer
+            self.worker_pool.start_result_listener(self.output_sequencer.add_result)
+            
+            # Start processing thread
+            self.running = True
+            self.start_time = time.time()
+            self.process_thread = threading.Thread(
+                target=self._process_loop,
+                name="ProcessLoop",
+                daemon=True
+            )
+            self.process_thread.start()
+        else:
+            # Capture-only: no worker pool or processing thread
+            self.output_sequencer = None
+            self.worker_pool = None
+            self.running = True
+            self.start_time = time.time()
         
         # Initialize camera pipelines - AFTER workers are ready
         self.cameras = [
@@ -2343,7 +2435,7 @@ class DepthSplatServer:
             states_str = " | ".join(cam_states)
             
             # Show actual in-flight count (pull model ensures this stays small)
-            in_flight = self.worker_pool.get_in_flight_count()
+            in_flight = self.worker_pool.get_in_flight_count() if self.worker_pool else 0
             dropped = self.frame_pairs_queued - self.frame_pairs_processed - in_flight
             if dropped < 0:
                 dropped = 0  # Can be negative briefly during transitions
@@ -2421,6 +2513,16 @@ class DepthSplatServer:
             with self.seq_counter_lock:
                 proc_seq_id = self.processing_seq_counter
                 self.processing_seq_counter += 1
+            
+            # Optional capture to disk
+            if self.capture_writer:
+                self.capture_writer.save_pair(proc_seq_id, frames_dict)
+                self.capture_saved += 1
+                if self.config.capture_only:
+                    if self.config.max_frame_pairs > 0 and self.capture_saved >= self.config.max_frame_pairs:
+                        print(f"[Capture] Reached limit of {self.config.max_frame_pairs} pairs, stopping...")
+                        self._request_stop()
+                    return
             
             # Store as latest frame (overwrites any previous unprocessed frame)
             with self.latest_frame_lock:
@@ -2826,6 +2928,123 @@ def run_file_inference(
     return output_bytes
 
 
+def load_captured_pairs(capture_dir: str) -> list[tuple[int, dict]]:
+    """
+    Load captured frame pairs from disk.
+    
+    Expects files written by FrameCaptureWriter:
+        seq_XXXXXX_cam0.png
+        seq_XXXXXX_cam1.png
+        seq_XXXXXX_meta.json
+    """
+    capture_path = Path(capture_dir)
+    if not capture_path.exists():
+        raise FileNotFoundError(f"Capture directory not found: {capture_path}")
+    
+    meta_files = sorted(capture_path.glob("seq_*_meta.json"))
+    if not meta_files:
+        raise ValueError(f"No capture metadata files found in: {capture_path}")
+    
+    pairs = []
+    for meta_path in meta_files:
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        seq_id = int(meta.get("seq_id", 0))
+        frames_dict = {}
+        cameras = meta.get("cameras", {})
+        for cam_id_str, info in cameras.items():
+            cam_id = int(cam_id_str)
+            img_rel = info.get("path", f"seq_{seq_id:06d}_cam{cam_id}.png")
+            img_path = capture_path / img_rel
+            if not img_path.exists():
+                print(f"[Replay] Missing image for seq {seq_id} cam{cam_id}: {img_path}")
+                continue
+            frame = np.array(Image.open(img_path).convert("RGB"), dtype=np.uint8)
+            timestamp_ns = int(info.get("timestamp_ns", time.time_ns()))
+            frames_dict[cam_id] = (timestamp_ns, frame)
+        if len(frames_dict) == 2:
+            pairs.append((seq_id, frames_dict))
+    
+    pairs.sort(key=lambda x: x[0])
+    return pairs
+
+
+def run_replay_stream(
+    capture_dir: str,
+    config: ServerConfig,
+):
+    """
+    Replay captured frames through the same multi-process pipeline.
+    
+    Args:
+        capture_dir: Directory produced by capture mode
+        config: ServerConfig controlling inference/output behavior
+    """
+    pairs = load_captured_pairs(capture_dir)
+    if config.max_frame_pairs > 0:
+        pairs = pairs[:config.max_frame_pairs]
+    
+    if config.verbose:
+        print(f"[Replay] Loaded {len(pairs)} frame pairs from {capture_dir}")
+    
+    # Prepare components
+    def on_output_complete(total_emitted: int):
+        if config.max_frame_pairs > 0 and total_emitted >= config.max_frame_pairs:
+            print(f"\n[Complete] Processed {total_emitted} frame pairs")
+    
+    output_sequencer = OutputSequencer(
+        config,
+        on_complete=on_output_complete,
+        save_files=config.save_files,
+    )
+    
+    worker_pool = GPUWorkerPool(config)
+    worker_pool.start()
+    print("\n" + "="*70)
+    print("Waiting for encoder initialization...")
+    print("="*70)
+    if not worker_pool.wait_all_ready(timeout=300):
+        print("ERROR: Workers failed to initialize within timeout")
+        worker_pool.stop()
+        return
+    print("="*70 + "\n")
+    worker_pool.start_result_listener(output_sequencer.add_result)
+    
+    min_frame_interval = 1.0 / config.max_fps if config.max_fps > 0 else 0.0
+    last_process_time = 0.0
+    submitted = 0
+    
+    for seq_id, frames_dict in pairs:
+        if min_frame_interval > 0:
+            now = time.time()
+            elapsed = now - last_process_time
+            if elapsed < min_frame_interval:
+                time.sleep(min_frame_interval - elapsed)
+            last_process_time = time.time()
+        
+        worker = worker_pool.wait_for_available_worker(timeout=60)
+        if worker is None:
+            print(f"[Replay] Timeout waiting for worker on seq {seq_id}")
+            break
+        
+        output_sequencer.mark_submitted(seq_id)
+        worker_pool.submit_to_worker(worker, seq_id, frames_dict)
+        submitted += 1
+    
+    # Wait for outstanding results
+    start_wait = time.time()
+    while output_sequencer.total_emitted < submitted:
+        time.sleep(0.1)
+        if time.time() - start_wait > 300:
+            print("[Replay] Timeout waiting for results")
+            break
+    
+    worker_pool.stop()
+    
+    if config.verbose:
+        print(f"[Replay] Completed {output_sequencer.total_emitted} outputs")
+
+
 def create_v4l2_config(device_0: str = "/dev/video0", device_1: str = "/dev/video2") -> ServerConfig:
     """Create a configuration for V4L2 cameras."""
     return ServerConfig(
@@ -3163,7 +3382,7 @@ Examples:
     )
     parser.add_argument(
         "--mode",
-        choices=["test", "file", "v4l2", "rtsp", "rtmp", "srt", "tcp", "webrtc", "custom"],
+        choices=["test", "file", "v4l2", "rtsp", "rtmp", "srt", "tcp", "webrtc", "capture", "replay", "custom"],
         default="file",
         help="Camera mode (default: file)"
     )
@@ -3181,6 +3400,16 @@ Examples:
         "--device1",
         default="/dev/video2",
         help="V4L2 device for camera 1"
+    )
+    parser.add_argument(
+        "--camera0-source",
+        default=None,
+        help="Custom GStreamer pipeline string for camera 0 (capture mode)"
+    )
+    parser.add_argument(
+        "--camera1-source",
+        default=None,
+        help="Custom GStreamer pipeline string for camera 1 (capture mode)"
     )
     parser.add_argument(
         "--rtsp0",
@@ -3264,6 +3493,21 @@ Examples:
         "--output-dir",
         default="stream-output",
         help="Output directory for PLY files"
+    )
+    parser.add_argument(
+        "--capture-dir",
+        default="captured-input",
+        help="Directory to save raw camera frames in capture mode"
+    )
+    parser.add_argument(
+        "--capture-format",
+        default="png",
+        help="Image format for captured frames (default: png)"
+    )
+    parser.add_argument(
+        "--replay-dir",
+        default=None,
+        help="Directory of captured frames for replay mode (defaults to --capture-dir)"
     )
     parser.add_argument(
         "--quiet",
@@ -3504,6 +3748,94 @@ Examples:
         server = WebRTCDepthSplatServer(config)
         try:
             server.start()
+        finally:
+            if websocket_streamer:
+                websocket_streamer.stop()
+        return
+    
+    # Capture-only mode: save synchronized camera pairs for later replay
+    if args.mode == "capture":
+        camera0_src = args.camera0_source or f"v4l2src device={args.device0} ! videoconvert"
+        camera1_src = args.camera1_source or f"v4l2src device={args.device1} ! videoconvert"
+        
+        config = ServerConfig(
+            camera_0_source=camera0_src,
+            camera_1_source=camera1_src,
+            capture_dir=args.capture_dir,
+            capture_only=True,
+            capture_format=args.capture_format,
+            max_frame_pairs=args.num_frames if args.num_frames > 0 else 0,
+            duration_seconds=args.duration,
+            verbose=not args.quiet,
+        )
+        
+        # Apply optional overrides
+        if args.frame_skip is not None:
+            config.frame_skip = args.frame_skip
+        if args.max_fps is not None:
+            config.max_fps = args.max_fps
+        config.output_dir = args.output_dir
+        config.output_format = args.format
+        
+        print("="*70)
+        print("Capture Mode")
+        print("="*70)
+        print(f"Camera 0 source: {config.camera_0_source}")
+        print(f"Camera 1 source: {config.camera_1_source}")
+        print(f"Capture dir:     {config.capture_dir}")
+        print(f"Frame skip:      {config.frame_skip}")
+        print(f"Max pairs:       {config.max_frame_pairs or 'unlimited'}")
+        print(f"Max duration:    {config.duration_seconds or 'unlimited'}s")
+        print("="*70 + "\n")
+        
+        server = DepthSplatServer(config)
+        server.start()
+        return
+    
+    # Replay captured frames using the multi-process pipeline
+    if args.mode == "replay":
+        replay_dir = args.replay_dir or args.capture_dir
+        
+        config = ServerConfig(
+            output_dir=args.output_dir,
+            output_format=args.format,
+            max_frame_pairs=args.num_frames if args.num_frames > 0 else 0,
+            max_fps=args.max_fps if args.max_fps is not None else 0.0,
+            verbose=not args.quiet,
+        )
+        
+        # Initialize WebSocket output streamer if enabled
+        websocket_streamer = None
+        if args.websocket:
+            try:
+                from websocket_streamer import WebSocketStreamer
+                
+                websocket_streamer = WebSocketStreamer(
+                    host=args.ws_host,
+                    port=args.ws_port,
+                    output_format=args.format,
+                    verbose=not args.quiet,
+                )
+                websocket_streamer.start()
+                config.output_callback = websocket_streamer.broadcast_frame
+                
+                if args.ws_only:
+                    config.save_files = False
+            except ImportError as e:
+                print(f"Warning: Could not enable WebSocket output streaming: {e}")
+        
+        print("="*70)
+        print("Replay Mode")
+        print("="*70)
+        print(f"Replay dir:  {replay_dir}")
+        print(f"Output dir:  {config.output_dir}")
+        print(f"Output fmt:  {config.output_format}")
+        print(f"Max pairs:   {config.max_frame_pairs or 'unlimited'}")
+        print(f"Max FPS:     {config.max_fps or 'unlimited'}")
+        print("="*70 + "\n")
+        
+        try:
+            run_replay_stream(replay_dir, config)
         finally:
             if websocket_streamer:
                 websocket_streamer.stop()
