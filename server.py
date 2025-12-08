@@ -684,10 +684,10 @@ class GPUWorkerPool:
     
     def _sanitize_config(self) -> dict:
         """Return a dict safe to send to worker processes (no callbacks)."""
-        cfg = asdict(self.config)
-        # Remove non-picklable fields
-        cfg["output_callback"] = None
-        return cfg
+        # Use dataclasses.replace to avoid deepcopying non-picklable callback objects
+        from dataclasses import replace
+        safe_config = replace(self.config, output_callback=None)
+        return asdict(safe_config)
     
     def start(self):
         """Initialize and start all worker processes."""
@@ -3367,6 +3367,9 @@ Examples:
   # TCP H.264 streams (client mode - connect to senders):
   python server.py --mode tcp --tcp0 192.168.1.100:5000 --tcp1 192.168.1.100:5001
   
+  # Capture-only with any streaming mode (save synchronized pairs, no inference):
+  python server.py --mode tcp --tcp-listen --capture-only --capture-dir captured-input
+  
   # WebRTC mode - receive streams from browsers/mobile apps:
   python server.py --mode webrtc --webrtc-port 8080
   
@@ -3382,7 +3385,7 @@ Examples:
     )
     parser.add_argument(
         "--mode",
-        choices=["test", "file", "v4l2", "rtsp", "rtmp", "srt", "tcp", "webrtc", "capture", "replay", "custom"],
+        choices=["test", "file", "v4l2", "rtsp", "rtmp", "srt", "tcp", "webrtc", "replay", "custom"],
         default="file",
         help="Camera mode (default: file)"
     )
@@ -3495,9 +3498,14 @@ Examples:
         help="Output directory for PLY files"
     )
     parser.add_argument(
+        "--capture-only",
+        action="store_true",
+        help="Capture synchronized frames to disk and skip inference (works with tcp/webrtc/rtsp/etc.)"
+    )
+    parser.add_argument(
         "--capture-dir",
         default="captured-input",
-        help="Directory to save raw camera frames in capture mode"
+        help="Directory to save raw camera frames when --capture-only is enabled"
     )
     parser.add_argument(
         "--capture-format",
@@ -3723,6 +3731,14 @@ Examples:
         if args.save_camera_input is not None:
             config.camera_input_dir = args.save_camera_input
         
+        # Capture-only flag works across modes (including WebRTC)
+        config.capture_only = args.capture_only
+        if args.capture_only:
+            config.capture_dir = args.capture_dir or "captured-input"
+            config.capture_format = args.capture_format
+        else:
+            config.capture_dir = None
+        
         # Initialize WebSocket output streamer if enabled
         websocket_streamer = None
         if args.websocket:
@@ -3751,45 +3767,6 @@ Examples:
         finally:
             if websocket_streamer:
                 websocket_streamer.stop()
-        return
-    
-    # Capture-only mode: save synchronized camera pairs for later replay
-    if args.mode == "capture":
-        camera0_src = args.camera0_source or f"v4l2src device={args.device0} ! videoconvert"
-        camera1_src = args.camera1_source or f"v4l2src device={args.device1} ! videoconvert"
-        
-        config = ServerConfig(
-            camera_0_source=camera0_src,
-            camera_1_source=camera1_src,
-            capture_dir=args.capture_dir,
-            capture_only=True,
-            capture_format=args.capture_format,
-            max_frame_pairs=args.num_frames if args.num_frames > 0 else 0,
-            duration_seconds=args.duration,
-            verbose=not args.quiet,
-        )
-        
-        # Apply optional overrides
-        if args.frame_skip is not None:
-            config.frame_skip = args.frame_skip
-        if args.max_fps is not None:
-            config.max_fps = args.max_fps
-        config.output_dir = args.output_dir
-        config.output_format = args.format
-        
-        print("="*70)
-        print("Capture Mode")
-        print("="*70)
-        print(f"Camera 0 source: {config.camera_0_source}")
-        print(f"Camera 1 source: {config.camera_1_source}")
-        print(f"Capture dir:     {config.capture_dir}")
-        print(f"Frame skip:      {config.frame_skip}")
-        print(f"Max pairs:       {config.max_frame_pairs or 'unlimited'}")
-        print(f"Max duration:    {config.duration_seconds or 'unlimited'}s")
-        print("="*70 + "\n")
-        
-        server = DepthSplatServer(config)
-        server.start()
         return
     
     # Replay captured frames using the multi-process pipeline
@@ -3991,6 +3968,14 @@ Examples:
     config.verbose = not args.quiet
     if args.save_camera_input is not None:
         config.camera_input_dir = args.save_camera_input
+    
+    # Capture-only flag works across modes (e.g., tcp/webrtc/rtsp)
+    config.capture_only = args.capture_only
+    if args.capture_only:
+        config.capture_dir = args.capture_dir or "captured-input"
+        config.capture_format = args.capture_format
+    else:
+        config.capture_dir = None
     
     # Initialize WebSocket streamer if enabled
     websocket_streamer = None
