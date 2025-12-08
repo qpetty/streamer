@@ -511,378 +511,314 @@ class FrameSynchronizer:
 
 
 # ============================================================================
-# GPU Worker Pool
+# GPU Worker Pool (multiprocessing, one process per GPU worker)
 # ============================================================================
 
-class GPUWorker:
-    """Worker that processes frame pairs on a specific GPU."""
+import multiprocessing as mp
+from types import SimpleNamespace
+from dataclasses import asdict
+
+# Ensure safe multiprocessing start method for CUDA
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    # Already set by another importer; safe to ignore
+    pass
+
+
+class GPUWorkerProcess(mp.Process):
+    """
+    Dedicated process that owns a single CUDA device and runs inference.
     
-    def __init__(self, gpu_id: int, worker_id: int, config: ServerConfig, on_available: Callable[['GPUWorker'], None] = None):
-        self.gpu_id = gpu_id
+    Communicates with the parent via:
+      - task_queue: receives (seq_id, frames_dict) or None for shutdown
+      - result_queue: sends {"type": "result", "seq_id": ..., "output": bytes|None}
+      - status_queue: sends {"type": "ready"/"available", "worker_id": ...}
+    """
+    
+    def __init__(
+        self,
+        worker_id: int,
+        gpu_id: int,
+        config_dict: dict,
+        task_queue: mp.Queue,
+        result_queue: mp.Queue,
+        status_queue: mp.Queue,
+    ):
+        super().__init__(daemon=True, name=f"GPUWorkerProc-{gpu_id}-{worker_id}")
         self.worker_id = worker_id
-        self.config = config
-        self.encoder: Optional[DepthSplatInference] = None
-        self.depth_anything: Optional[DepthAnything3] = None
-        # Latest task buffer (always process newest task for lowest latency)
-        self.latest_task: Optional[tuple] = None
-        self.latest_task_lock = threading.Lock()
-        self.latest_task_event = threading.Event()
-        self.running = False
-        self.thread: Optional[threading.Thread] = None
-        self.ready_event = threading.Event()  # Signals when models are loaded
-        self._on_available = on_available  # Callback when worker becomes available
-        self._is_processing = False  # Track if currently processing
-        
-    def start(self):
-        """Start the worker thread."""
-        self.running = True
-        self.ready_event.clear()
-        self.thread = threading.Thread(
-            target=self._run,
-            name=f"GPUWorker-{self.gpu_id}-{self.worker_id}",
-            daemon=True
-        )
-        self.thread.start()
+        self.gpu_id = gpu_id
+        self.config_dict = config_dict
+        self.task_queue = task_queue
+        self.result_queue = result_queue
+        self.status_queue = status_queue
     
-    def wait_ready(self, timeout: float = None) -> bool:
-        """Wait for the worker to be ready (models loaded)."""
-        return self.ready_event.wait(timeout=timeout)
-        
-    def stop(self):
-        """Stop the worker thread."""
-        self.running = False
-        self.latest_task_event.set()  # Wake up the thread so it can exit
-        if self.thread:
-            self.thread.join(timeout=5.0)
-            
-    def submit(self, task: tuple):
-        """Submit a task to this worker (overwrites any pending task)."""
-        seq_id = task[0]
-        with self.latest_task_lock:
-            old_task = self.latest_task
-            self.latest_task = task
-            if old_task is not None:
-                old_seq_id = old_task[0]
-                # Call cancel callback for the replaced task
-                if len(old_task) > 3 and old_task[3] is not None:
-                    old_task[3](old_seq_id)  # cancel_callback(old_seq_id)
-        self.latest_task_event.set()
-        
-    def _run(self):
-        """Worker thread main loop."""
-        # Initialize models on this GPU
+    def run(self):
+        # Each process owns one CUDA device/context
         torch.cuda.set_device(self.gpu_id)
         device = torch.device(f"cuda:{self.gpu_id}")
+        config = SimpleNamespace(**self.config_dict)
         
-        if self.config.verbose:
-            print(f"[Worker {self.gpu_id}:{self.worker_id}] Initializing DepthAnything3 on GPU {self.gpu_id}")
+        if config.verbose:
+            print(f"[Worker {self.gpu_id}:{self.worker_id}] Initializing models (process)")
         
-        # Initialize DepthAnything3 for camera estimation
-        self.depth_anything = DepthAnything3.from_pretrained(self.config.depth_anything_model)
-        self.depth_anything = self.depth_anything.to(device=device)
-        self.depth_anything.eval()
+        # Initialize models
+        depth_anything = DepthAnything3.from_pretrained(config.depth_anything_model)
+        depth_anything = depth_anything.to(device=device)
+        depth_anything.eval()
         
-        if self.config.verbose:
-            print(f"[Worker {self.gpu_id}:{self.worker_id}] Initializing DepthSplat encoder on GPU {self.gpu_id}")
+        encoder = DepthSplatInference(device=f"cuda:{self.gpu_id}")
         
-        # Initialize DepthSplat encoder - explicitly pass device to ensure correct GPU
-        self.encoder = DepthSplatInference(device=f"cuda:{self.gpu_id}")
+        if config.verbose:
+            print(f"[Worker {self.gpu_id}:{self.worker_id}] Models ready")
         
-        if self.config.verbose:
-            print(f"[Worker {self.gpu_id}:{self.worker_id}] Both models ready")
+        # Signal readiness and initial availability
+        self.status_queue.put({"type": "ready", "worker_id": self.worker_id})
+        self.status_queue.put({"type": "available", "worker_id": self.worker_id})
         
-        # Signal that we're ready
-        self.ready_event.set()
-        
-        # Signal initial availability after models are loaded
-        if self._on_available:
-            self._on_available(self)
-        
-        while self.running:
+        while True:
+            item = self.task_queue.get()
+            if item is None:
+                break  # Shutdown signal
+            seq_id, frames_dict = item
+            output_bytes = None
+            
             try:
-                # Wait for a task to be available
-                if not self.latest_task_event.wait(timeout=1.0):
-                    continue  # Timeout, check if still running
-                
-                # Grab the latest task atomically
-                with self.latest_task_lock:
-                    if self.latest_task is None:
-                        self.latest_task_event.clear()
-                        continue
+                with torch.inference_mode():
+                    # Extract frames
+                    frame_0 = frames_dict[0][1]
+                    frame_1 = frames_dict[1][1]
+                    orig_height, orig_width = frame_0.shape[:2]
                     
-                    task = self.latest_task
-                    self.latest_task = None
-                    self.latest_task_event.clear()
-                    self._is_processing = True
-                
-                seq_id, frames_dict, result_callback, _cancel_callback = task
-                self._process_task(seq_id, frames_dict, result_callback)
-                
-                # Mark as available and signal pool
-                self._is_processing = False
-                if self._on_available:
-                    self._on_available(self)
-                
+                    # DepthAnything3 inference
+                    prediction = depth_anything.inference(
+                        image=[frame_0, frame_1],
+                        process_res=config.depth_anything_process_res,
+                        process_res_method="upper_bound_resize",
+                    )
+                    torch.cuda.synchronize(device)
+                    
+                    processed_height, processed_width = prediction.processed_images.shape[1:3]
+                    w2c_extrinsics = prediction.extrinsics
+                    c2w_poses = w2c_to_c2w(w2c_extrinsics)
+                    
+                    scaled_intrinsics = scale_intrinsics(
+                        prediction.intrinsics,
+                        from_width=processed_width,
+                        from_height=processed_height,
+                        to_width=orig_width,
+                        to_height=orig_height,
+                    )
+                    
+                    # Prepare tensors for DepthSplat
+                    frame_0_tensor = torch.from_numpy(frame_0).permute(2, 0, 1).float() / 255.0
+                    frame_1_tensor = torch.from_numpy(frame_1).permute(2, 0, 1).float() / 255.0
+                    images = torch.stack([frame_0_tensor, frame_1_tensor], dim=0)
+                    
+                    intrinsics_list = [scaled_intrinsics[0], scaled_intrinsics[1]]
+                    extrinsics_list = [c2w_poses[0], c2w_poses[1]]
+                    original_sizes = [(orig_width, orig_height), (orig_width, orig_height)]
+                    
+                    inference_config = InferenceConfig(
+                        target_height=config.target_height,
+                        target_width=config.target_width,
+                        near_disparity=config.near_disparity,
+                        far_disparity=config.far_disparity,
+                        verbose=False,
+                        output_format=config.output_format,
+                    )
+                    
+                    output_bytes = encoder.run_from_data(
+                        images=images,
+                        intrinsics_list=intrinsics_list,
+                        extrinsics_list=extrinsics_list,
+                        original_sizes=original_sizes,
+                        image_filenames=[f"cam0_seq{seq_id}", f"cam1_seq{seq_id}"],
+                        config=inference_config,
+                    )
+                    
             except Exception as e:
-                print(f"[Worker {self.gpu_id}:{self.worker_id}] Error: {e}")
-                self._is_processing = False
-                if self._on_available:
-                    self._on_available(self)
-                
-    def _process_task(self, seq_id: int, frames_dict: dict, result_callback: Callable):
-        """Process a frame pair and invoke callback with result."""
-        try:
-            start_time = time.time()
+                print(f"[Worker {self.gpu_id}:{self.worker_id}] Error on seq {seq_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                output_bytes = None
             
-            # Extract frames - HWC uint8 numpy arrays
-            frame_0 = frames_dict[0][1]  # (timestamp, frame) -> frame
-            frame_1 = frames_dict[1][1]
-            
-            # Get original image dimensions
-            orig_height, orig_width = frame_0.shape[:2]
-            
-            # Save camera input frames if enabled
-            if self.config.camera_input_dir:
-                save_dir = Path(self.config.camera_input_dir)
-                save_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Save both frames as PNG
-                img_0 = Image.fromarray(frame_0)
-                img_1 = Image.fromarray(frame_1)
-                
-                path_0 = save_dir / f"seq_{seq_id:05d}_cam0.png"
-                path_1 = save_dir / f"seq_{seq_id:05d}_cam1.png"
-                
-                img_0.save(path_0)
-                img_1.save(path_1)
-                
-                if self.config.verbose:
-                    print(f"[Worker {self.gpu_id}:{self.worker_id}] Saved input frames to {path_0} and {path_1}")
-            
-            
-            # Run DepthAnything3 to get intrinsics and extrinsics (W2C)
-            # Pass numpy arrays directly - DepthAnything3 accepts HWC uint8 arrays
-            da3_start = time.time()
-            prediction = self.depth_anything.inference(
-                image=[frame_0, frame_1],  # List of HWC uint8 numpy arrays
-                process_res=self.config.depth_anything_process_res,
-                process_res_method="upper_bound_resize",
-            )
-            # Synchronize CUDA operations on this GPU before using the results
-            # This ensures all GPU operations complete before we access the outputs
-            torch.cuda.synchronize(self.gpu_id)
-            da3_elapsed = time.time() - da3_start
-            
-            
-            # Get processed image size from DepthAnything3 for intrinsics scaling
-            processed_height, processed_width = prediction.processed_images.shape[1:3]
-            
-            # DepthAnything3 outputs W2C extrinsics - convert to C2W poses for DepthSplat
-            # DepthSplat's "extrinsics" parameter actually expects C2W (camera-to-world) poses
-            w2c_extrinsics = prediction.extrinsics  # [N, 3, 4] or [N, 4, 4] - W2C
-            c2w_poses = w2c_to_c2w(w2c_extrinsics)  # [N, 4, 4] - C2W
-            
-            # Scale intrinsics from processed_images size to original input size
-            da3_intrinsics = prediction.intrinsics  # [N, 3, 3] for processed size
-            scaled_intrinsics = scale_intrinsics(
-                da3_intrinsics,
-                from_width=processed_width,
-                from_height=processed_height,
-                to_width=orig_width,
-                to_height=orig_height,
-            )
-            
-            
-            # Convert frames to tensors for DepthSplat - use ORIGINAL images, not processed
-            # Convert from HWC uint8 to CHW float [0, 1]
-            frame_0_tensor = torch.from_numpy(frame_0).permute(2, 0, 1).float() / 255.0
-            frame_1_tensor = torch.from_numpy(frame_1).permute(2, 0, 1).float() / 255.0
-            images = torch.stack([frame_0_tensor, frame_1_tensor], dim=0)
-            
-            # Prepare lists for DepthSplat
-            intrinsics_list = [scaled_intrinsics[0], scaled_intrinsics[1]]
-            extrinsics_list = [c2w_poses[0], c2w_poses[1]]  # C2W poses
-            original_sizes = [
-                (orig_width, orig_height),
-                (orig_width, orig_height),
-            ]
-            
-            
-            # Run DepthSplat encoder inference
-            encoder_start = time.time()
-            inference_config = InferenceConfig(
-                target_height=self.config.target_height,
-                target_width=self.config.target_width,
-                near_disparity=self.config.near_disparity,
-                far_disparity=self.config.far_disparity,
-                verbose=False,  # Suppress verbose output in streaming mode
-                output_format=self.config.output_format,
-            )
-            
-            output_bytes = self.encoder.run_from_data(
-                images=images,
-                intrinsics_list=intrinsics_list,
-                extrinsics_list=extrinsics_list,
-                original_sizes=original_sizes,
-                image_filenames=[f"cam0_seq{seq_id}", f"cam1_seq{seq_id}"],
-                config=inference_config,
-            )
-            encoder_elapsed = time.time() - encoder_start
-            
-            total_elapsed = time.time() - start_time
-            
-            if self.config.verbose:
-                print(f"[Worker {self.gpu_id}:{self.worker_id}] Seq {seq_id} completed in {total_elapsed:.2f}s")
-            
-            # Invoke callback with result
-            result_callback(seq_id, output_bytes)
-            
-        except Exception as e:
-            print(f"[Worker {self.gpu_id}:{self.worker_id}] Failed to process seq {seq_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            # Notify sequencer of failure so it doesn't block on this seq
-            # Pass None as output_bytes to indicate failure
-            result_callback(seq_id, None)
+            # Send result and mark available again
+            self.result_queue.put({"seq_id": seq_id, "output": output_bytes})
+            self.status_queue.put({"type": "available", "worker_id": self.worker_id})
+        
+        if config.verbose:
+            print(f"[Worker {self.gpu_id}:{self.worker_id}] Shutting down")
+
+
+@dataclass
+class _WorkerHandle:
+    worker_id: int
+    gpu_id: int
+    process: GPUWorkerProcess
+    task_queue: mp.Queue
 
 
 class GPUWorkerPool:
-    """Pool of GPU workers for distributed inference."""
+    """Pool of GPU worker processes for distributed inference."""
     
     def __init__(self, config: ServerConfig):
         self.config = config
-        self.workers: list[GPUWorker] = []
-        self.worker_index = 0
-        self.lock = threading.Lock()
-        
-        # Available worker tracking for pull-based model
-        self._available_workers: list[GPUWorker] = []
-        self._available_lock = threading.Lock()
-        self._available_event = threading.Event()  # Signals when a worker becomes available
-        
-    def _on_worker_available(self, worker: GPUWorker):
-        """Called when a worker becomes available for new work."""
-        with self._available_lock:
-            if worker not in self._available_workers:
-                self._available_workers.append(worker)
-        self._available_event.set()
-        
+        self.workers: list[_WorkerHandle] = []
+        self.status_queue: mp.Queue = mp.Queue()
+        self.result_queue: mp.Queue = mp.Queue()
+        self._available_event = threading.Event()
+        self._available_worker_ids: list[int] = []
+        self._result_thread: Optional[threading.Thread] = None
+        self._result_stop = threading.Event()
+        self._result_callback: Optional[Callable[[int, bytes], None]] = None
+    
+    def _sanitize_config(self) -> dict:
+        """Return a dict safe to send to worker processes (no callbacks)."""
+        cfg = asdict(self.config)
+        # Remove non-picklable fields
+        cfg["output_callback"] = None
+        return cfg
+    
     def start(self):
-        """Initialize and start all workers (non-blocking)."""
-        # Determine available GPUs
+        """Initialize and start all worker processes."""
         if self.config.gpu_ids:
             gpu_ids = self.config.gpu_ids
         elif torch.cuda.is_available():
             gpu_ids = list(range(torch.cuda.device_count()))
         else:
             print("WARNING: No CUDA GPUs available, using CPU (will be slow)")
-            gpu_ids = [0]  # Fake GPU ID for CPU fallback
+            gpu_ids = [0]
         
         print(f"Initializing worker pool with GPUs: {gpu_ids}")
+        config_dict = self._sanitize_config()
+        worker_id = 0
         
         for gpu_id in gpu_ids:
-            for worker_idx in range(self.config.workers_per_gpu):
-                worker = GPUWorker(gpu_id, worker_idx, self.config, on_available=self._on_worker_available)
-                self.workers.append(worker)
-                worker.start()
+            for _ in range(self.config.workers_per_gpu):
+                task_q = mp.Queue(maxsize=1)
+                proc = GPUWorkerProcess(
+                    worker_id=worker_id,
+                    gpu_id=gpu_id,
+                    config_dict=config_dict,
+                    task_queue=task_q,
+                    result_queue=self.result_queue,
+                    status_queue=self.status_queue,
+                )
+                handle = _WorkerHandle(
+                    worker_id=worker_id,
+                    gpu_id=gpu_id,
+                    process=proc,
+                    task_queue=task_q,
+                )
+                self.workers.append(handle)
+                proc.start()
+                worker_id += 1
         
         print(f"Worker pool started with {len(self.workers)} workers")
     
     def wait_all_ready(self, timeout: float = None) -> bool:
-        """
-        Wait for all workers to be ready (models loaded).
+        """Wait for all workers to signal readiness."""
+        expected = len(self.workers)
+        ready_count = 0
+        start = time.time()
         
-        Args:
-            timeout: Maximum time to wait in seconds (None = wait forever)
-            
-        Returns:
-            True if all workers are ready, False if timeout occurred
-        """
-        print(f"Waiting for {len(self.workers)} worker(s) to initialize...")
-        start_time = time.time()
-        
-        for i, worker in enumerate(self.workers):
+        while ready_count < expected:
             remaining = None
             if timeout is not None:
-                elapsed = time.time() - start_time
-                remaining = max(0, timeout - elapsed)
-                if remaining <= 0:
-                    print(f"Timeout waiting for workers (only {i}/{len(self.workers)} ready)")
-                    return False
-            
-            if not worker.wait_ready(timeout=remaining):
-                print(f"Timeout waiting for worker {worker.gpu_id}:{worker.worker_id}")
-                return False
-        
-        print(f"All {len(self.workers)} worker(s) ready!")
-        return True
-        
-    def stop(self):
-        """Stop all workers."""
-        for worker in self.workers:
-            worker.stop()
-        print("Worker pool stopped")
-    
-    def wait_for_available_worker(self, timeout: float = None) -> Optional[GPUWorker]:
-        """
-        Wait for a worker to become available (pull-based model).
-        
-        This blocks until a worker finishes processing and is ready for new work.
-        Use this for lowest-latency streaming where you want to process only
-        the newest frame when a worker becomes free.
-        
-        Args:
-            timeout: Maximum time to wait in seconds (None = wait forever)
-            
-        Returns:
-            An available GPUWorker, or None if timeout occurred
-        """
-        start_time = time.time()
-        
-        while True:
-            # Check for available workers
-            with self._available_lock:
-                if self._available_workers:
-                    worker = self._available_workers.pop(0)
-                    # Clear event if no more workers available
-                    if not self._available_workers:
-                        self._available_event.clear()
-                    return worker
-            
-            # Calculate remaining timeout
-            if timeout is not None:
-                elapsed = time.time() - start_time
+                elapsed = time.time() - start
                 remaining = timeout - elapsed
                 if remaining <= 0:
-                    return None
-            else:
-                remaining = 1.0  # Use 1s polling interval when no timeout
+                    print(f"Timeout waiting for workers ({ready_count}/{expected} ready)")
+                    return False
+            try:
+                msg = self.status_queue.get(timeout=remaining if remaining is not None else 1.0)
+            except Exception:
+                continue
             
-            # Wait for availability signal
-            self._available_event.wait(timeout=min(remaining, 1.0))
+            if msg.get("type") == "ready":
+                ready_count += 1
+            elif msg.get("type") == "available":
+                self._available_worker_ids.append(msg["worker_id"])
+                self._available_event.set()
+        
+        print(f"All {expected} worker(s) ready!")
+        return True
     
-    def submit_to_worker(self, worker: GPUWorker, seq_id: int, frames_dict: dict, 
-                         result_callback: Callable, cancel_callback: Callable = None):
-        """Submit a task to a specific worker (for pull-based model)."""
-        with self._available_lock:
-            # Remove from available list if present (shouldn't be, but just in case)
-            if worker in self._available_workers:
-                self._available_workers.remove(worker)
-        worker.submit((seq_id, frames_dict, result_callback, cancel_callback))
+    def start_result_listener(self, result_callback: Callable[[int, bytes], None]):
+        """Start a thread to forward worker results to the provided callback."""
+        self._result_callback = result_callback
+        self._result_stop.clear()
+        
+        def _loop():
+            while not self._result_stop.is_set():
+                try:
+                    msg = self.result_queue.get(timeout=0.5)
+                except Exception:
+                    continue
+                seq_id = msg.get("seq_id")
+                output = msg.get("output")
+                if self._result_callback:
+                    self._result_callback(seq_id, output)
+        
+        self._result_thread = threading.Thread(target=_loop, name="ResultListener", daemon=True)
+        self._result_thread.start()
+    
+    def stop_result_listener(self):
+        """Stop the result listener thread."""
+        self._result_stop.set()
+        if self._result_thread:
+            self._result_thread.join(timeout=2.0)
+    
+    def stop(self):
+        """Stop all workers and listener."""
+        self.stop_result_listener()
+        for handle in self.workers:
+            try:
+                handle.task_queue.put_nowait(None)
+            except Exception:
+                pass
+        for handle in self.workers:
+            handle.process.join(timeout=5.0)
+        print("Worker pool stopped")
+    
+    def wait_for_available_worker(self, timeout: float = None) -> Optional[_WorkerHandle]:
+        """Block until a worker becomes available (pull model)."""
+        start = time.time()
+        while True:
+            if self._available_worker_ids:
+                worker_id = self._available_worker_ids.pop(0)
+                return next((w for w in self.workers if w.worker_id == worker_id), None)
+            
+            if timeout is not None:
+                elapsed = time.time() - start
+                if elapsed >= timeout:
+                    return None
+            
+            try:
+                remaining = None
+                if timeout is not None:
+                    remaining = max(0.0, timeout - (time.time() - start))
+                msg = self.status_queue.get(timeout=remaining if remaining else 1.0)
+                if msg.get("type") == "available":
+                    self._available_worker_ids.append(msg["worker_id"])
+                    self._available_event.set()
+            except Exception:
+                continue
+    
+    def submit_to_worker(self, worker: _WorkerHandle, seq_id: int, frames_dict: dict):
+        """Submit work to a specific worker (queue depth 1)."""
+        if worker.worker_id in self._available_worker_ids:
+            self._available_worker_ids.remove(worker.worker_id)
+        try:
+            worker.task_queue.put_nowait((seq_id, frames_dict))
+        except Exception:
+            # If queue is full, drop silently (shouldn't happen with pull model)
+            pass
     
     def get_in_flight_count(self) -> int:
-        """Get number of frames currently being processed or waiting."""
-        with self._available_lock:
-            available_count = len(self._available_workers)
-        return len(self.workers) - available_count
-        
-    def submit(self, seq_id: int, frames_dict: dict, result_callback: Callable, cancel_callback: Callable = None):
-        """Submit a task to the next available worker (round-robin - legacy push model)."""
-        with self.lock:
-            worker = self.workers[self.worker_index]
-            self.worker_index = (self.worker_index + 1) % len(self.workers)
-        
-        worker.submit((seq_id, frames_dict, result_callback, cancel_callback))
+        """Approximate count of busy workers."""
+        return len(self.workers) - len(self._available_worker_ids)
 
 
 # ============================================================================
@@ -2046,6 +1982,9 @@ class WebRTCDepthSplatServer:
             return
         print("="*70 + "\n")
         
+        # Start result listener to feed OutputSequencer
+        self.worker_pool.start_result_listener(self.output_sequencer.add_result)
+        
         # Start processing thread
         self.running = True
         self.start_time = time.time()
@@ -2256,8 +2195,6 @@ class WebRTCDepthSplatServer:
                 worker,
                 seq_id,
                 frames_dict,
-                self.output_sequencer.add_result,
-                self.output_sequencer.cancel_submitted
             )
 
 
@@ -2350,6 +2287,9 @@ class DepthSplatServer:
             print("ERROR: Workers failed to initialize within timeout")
             return
         print("="*70 + "\n")
+        
+        # Start result listener to feed OutputSequencer
+        self.worker_pool.start_result_listener(self.output_sequencer.add_result)
         
         # Start processing thread
         self.running = True
@@ -2541,8 +2481,6 @@ class DepthSplatServer:
                 worker,
                 seq_id,
                 frames_dict,
-                self.output_sequencer.add_result,
-                self.output_sequencer.cancel_submitted
             )
                 
     def _save_debug_frames(self, seq_id: int, frames_dict: dict):
