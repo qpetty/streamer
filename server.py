@@ -3215,6 +3215,9 @@ def create_tcp_h264_config(
     elif stream_format == "flv":
         # FLV container
         decoder = "flvdemux ! h264parse ! avdec_h264 ! videoconvert"
+    elif stream_format == "mjpeg":
+        # Multipart Motion JPEG over TCP
+        decoder = "multipartdemux boundary=frame ! jpegdec ! videoconvert"
     else:  # "auto" or anything else
         # Auto-detect using decodebin
         decoder = "decodebin ! videoconvert"
@@ -3464,9 +3467,9 @@ Examples:
     )
     parser.add_argument(
         "--tcp-format",
-        choices=["auto", "h264", "ts", "mpegts", "flv"],
+        choices=["auto", "h264", "ts", "mpegts", "flv", "mjpeg"],
         default="auto",
-        help="TCP stream format: auto (default), h264 (raw Annex B), ts/mpegts (MPEG-TS container), flv"
+        help="TCP stream format: auto (default), h264 (raw Annex B), ts/mpegts (MPEG-TS container), flv, mjpeg (multipart JPEG)"
     )
     parser.add_argument(
         "--frame-skip",
