@@ -595,17 +595,21 @@ class GPUWorkerProcess(mp.Process):
             try:
                 with torch.inference_mode():
                     # Extract frames
+                    t_start = time.perf_counter()
                     frame_0 = frames_dict[0][1]
                     frame_1 = frames_dict[1][1]
                     orig_height, orig_width = frame_0.shape[:2]
                     
                     # DepthAnything3 inference
+                    da3_start = time.perf_counter()
                     prediction = depth_anything.inference(
                         image=[frame_0, frame_1],
                         process_res=config.depth_anything_process_res,
                         process_res_method="upper_bound_resize",
                     )
                     torch.cuda.synchronize(device)
+                    da3_end = time.perf_counter()
+                    da3_elapsed = da3_end - da3_start
                     
                     processed_height, processed_width = prediction.processed_images.shape[1:3]
                     w2c_extrinsics = prediction.extrinsics
@@ -620,9 +624,12 @@ class GPUWorkerProcess(mp.Process):
                     )
                     
                     # Prepare tensors for DepthSplat
+                    prep_start = da3_end
                     frame_0_tensor = torch.from_numpy(frame_0).permute(2, 0, 1).float() / 255.0
                     frame_1_tensor = torch.from_numpy(frame_1).permute(2, 0, 1).float() / 255.0
                     images = torch.stack([frame_0_tensor, frame_1_tensor], dim=0)
+                    prep_end = time.perf_counter()
+                    prep_elapsed = prep_end - prep_start
                     
                     intrinsics_list = [scaled_intrinsics[0], scaled_intrinsics[1]]
                     extrinsics_list = [c2w_poses[0], c2w_poses[1]]
@@ -637,6 +644,7 @@ class GPUWorkerProcess(mp.Process):
                         output_format=config.output_format,
                     )
                     
+                    encode_start = prep_end
                     output_bytes = encoder.run_from_data(
                         images=images,
                         intrinsics_list=intrinsics_list,
@@ -645,6 +653,16 @@ class GPUWorkerProcess(mp.Process):
                         image_filenames=[f"cam0_seq{seq_id}", f"cam1_seq{seq_id}"],
                         config=inference_config,
                     )
+                    torch.cuda.synchronize(device)
+                    encode_end = time.perf_counter()
+                    encode_elapsed = encode_end - encode_start
+                    total_elapsed = encode_end - t_start
+                    if config.verbose:
+                        print(
+                            f"[Worker {self.gpu_id}:{self.worker_id}] seq {seq_id} timings: "
+                            f"DA3={da3_elapsed:.3f}s | prep={prep_elapsed:.3f}s | "
+                            f"encode={encode_elapsed:.3f}s | total={total_elapsed:.3f}s"
+                        )
                     
             except Exception as e:
                 print(f"[Worker {self.gpu_id}:{self.worker_id}] Error on seq {seq_id}: {e}")
@@ -848,6 +866,7 @@ class OutputSequencer:
         config: ServerConfig,
         on_complete: Optional[Callable[[int], None]] = None,
         save_files: bool = True,
+        latency_hook: Optional[Callable[[int, str, dict], None]] = None,
     ):
         """
         Initialize output sequencer.
@@ -865,6 +884,7 @@ class OutputSequencer:
         if self.save_files:
             self.output_dir.mkdir(parents=True, exist_ok=True)
         self.on_complete = on_complete  # Callback when a PLY is emitted
+        self.latency_hook = latency_hook
         
         # Track in-flight seq_ids in submission order
         self.in_flight: list[int] = []  # Ordered list of seq_ids submitted to workers
@@ -923,6 +943,12 @@ class OutputSequencer:
                         print(f"[Output] Sent seq {seq_id} via callback ({size_mb:.2f} MB)")
                 except Exception as e:
                     print(f"Output callback error for seq {seq_id}: {e}")
+            
+            if self.latency_hook:
+                try:
+                    self.latency_hook(seq_id, "emit", {"size_mb": size_mb})
+                except Exception as e:
+                    print(f"[Latency] emit hook failed for seq {seq_id}: {e}")
             
             # Save to file if enabled
             if self.save_files:
@@ -1034,7 +1060,8 @@ class CameraPipeline:
             f"video/x-raw,width={width},height={height} ! "
             f"videoconvert ! "
             f"video/x-raw,format=RGB ! "
-            f"appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false"
+            f"queue max-size-buffers=1 leaky=downstream ! "
+            f"appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false"
         )
         return pipeline
         
@@ -1984,6 +2011,14 @@ class WebRTCDepthSplatServer:
             else None
         )
         self.capture_saved = 0
+        self.cam_frame_counts = [0, 0]
+        self.last_status_counts = [0, 0]
+        self.last_status_time = time.time()
+        self.latest_frame_overwrites = 0
+        self.latency_tracker: dict[int, dict[str, float]] = {}
+        self.last_frame_wall: list[float] = [0.0, 0.0]
+        self.last_frame_ts: list[int] = [0, 0]
+        self.duplicate_ts_counts: list[int] = [0, 0]
         
         # Rate limiting
         self.last_process_time = 0.0
@@ -2031,6 +2066,7 @@ class WebRTCDepthSplatServer:
             self.config,
             on_complete=on_output_complete,
             save_files=self.config.save_files,
+            latency_hook=self._on_output_emitted,
         )
         
         if not self.config.capture_only:
@@ -2047,7 +2083,7 @@ class WebRTCDepthSplatServer:
             print("="*70 + "\n")
             
             # Start result listener to feed OutputSequencer
-            self.worker_pool.start_result_listener(self.output_sequencer.add_result)
+            self.worker_pool.start_result_listener(self._on_worker_result)
             
             # Start processing thread
             self.running = True
@@ -2110,6 +2146,14 @@ class WebRTCDepthSplatServer:
             elapsed = time.time() - self.start_time
             cam0_status = "✓" if self.cameras[0].connected else "✗"
             cam1_status = "✓" if self.cameras[1].connected else "✗"
+            now = time.time()
+            interval = max(1e-6, now - self.last_status_time)
+            fps0 = (self.cam_frame_counts[0] - self.last_status_counts[0]) / interval
+            fps1 = (self.cam_frame_counts[1] - self.last_status_counts[1]) / interval
+            self.last_status_counts = list(self.cam_frame_counts)
+            self.last_status_time = now
+            age0 = now - self.last_frame_wall[0] if self.last_frame_wall[0] > 0 else float("inf")
+            age1 = now - self.last_frame_wall[1] if self.last_frame_wall[1] > 0 else float("inf")
             
             # Show actual in-flight count (pull model ensures this stays small)
             in_flight = self.worker_pool.get_in_flight_count() if self.worker_pool else 0
@@ -2117,7 +2161,13 @@ class WebRTCDepthSplatServer:
             if dropped < 0:
                 dropped = 0  # Can be negative briefly during transitions
             
-            print(f"[Status] Elapsed: {elapsed:.1f}s | Cameras: [{cam0_status}|{cam1_status}] | InFlight: {in_flight} | Processed: {self.frame_pairs_processed} | Dropped: {dropped}")
+            print(
+                f"[Status] Elapsed: {elapsed:.1f}s | Cameras: [{cam0_status}|{cam1_status}] "
+                f"FPS: [{fps0:.1f}|{fps1:.1f}] | InFlight: {in_flight} | "
+                f"Processed: {self.frame_pairs_processed} | Dropped: {dropped} | "
+                f"Overwrites: {self.latest_frame_overwrites} | "
+                f"Age: [{age0:.2f}s|{age1:.2f}s]"
+            )
             return True
         GLib.timeout_add(5000, report_status)
         
@@ -2190,6 +2240,16 @@ class WebRTCDepthSplatServer:
         """Handle incoming frame from a WebRTC camera."""
         if not self.running:
             return
+        self.cam_frame_counts[camera_id] += 1
+        now = time.time()
+        if self.last_frame_ts[camera_id] == timestamp_ns:
+            self.duplicate_ts_counts[camera_id] += 1
+            if self.duplicate_ts_counts[camera_id] % 50 == 1 and self.config.verbose:
+                print(f"[Camera {camera_id}] Warning: duplicate timestamp frames seen ({self.duplicate_ts_counts[camera_id]})")
+        else:
+            self.duplicate_ts_counts[camera_id] = 0
+        self.last_frame_ts[camera_id] = timestamp_ns
+        self.last_frame_wall[camera_id] = now
         
         if self.config.max_frame_pairs > 0 and self.frame_pairs_queued >= self.config.max_frame_pairs:
             return
@@ -2228,6 +2288,15 @@ class WebRTCDepthSplatServer:
                 old_frame = self.latest_frame
                 self.latest_frame = (proc_seq_id, frames_dict)
                 self.frame_pairs_queued += 1
+                if old_frame is not None:
+                    self.latest_frame_overwrites += 1
+            ts0 = frames_dict[0][0]
+            ts1 = frames_dict[1][0]
+            skew_ms = abs(ts0 - ts1) / 1_000_000
+            self.latency_tracker[proc_seq_id] = {
+                "paired_at": time.time(),
+                "skew_ms": skew_ms,
+            }
                 
             
             # Signal that a new frame is available
@@ -2269,12 +2338,49 @@ class WebRTCDepthSplatServer:
                 break
             
             # Mark as submitted for correct output ordering, then submit to specific worker
+            self._record_latency(seq_id, "submitted")
             self.output_sequencer.mark_submitted(seq_id)
             self.worker_pool.submit_to_worker(
                 worker,
                 seq_id,
                 frames_dict,
             )
+
+    def _on_worker_result(self, seq_id: int, output: bytes):
+        """Record latency and forward result to sequencer."""
+        self._record_latency(seq_id, "result")
+        self.output_sequencer.add_result(seq_id, output)
+
+    def _on_output_emitted(self, seq_id: int, stage: str, extra: dict):
+        """Latency hook from OutputSequencer."""
+        self._record_latency(seq_id, stage, **extra)
+        entry = self.latency_tracker.get(seq_id, {})
+        paired_at = entry.get("paired_at")
+        submit_ts = entry.get("submitted_ts")
+        result_ts = entry.get("result_ts")
+        emit_ts = entry.get("emit_ts", time.time())
+        skew_ms = entry.get("skew_ms", 0.0)
+        if paired_at:
+            pair_to_submit = (submit_ts - paired_at) if submit_ts else float("nan")
+            submit_to_result = (result_ts - submit_ts) if (submit_ts and result_ts) else float("nan")
+            result_to_emit = (emit_ts - result_ts) if (emit_ts and result_ts) else float("nan")
+            total = emit_ts - paired_at
+            print(
+                "[Latency] seq "
+                f"{seq_id} | skew {skew_ms:.1f}ms | "
+                f"pair→submit {pair_to_submit:.3f}s | "
+                f"submit→result {submit_to_result:.3f}s | "
+                f"result→emit {result_to_emit:.3f}s | "
+                f"total {total:.3f}s | size {extra.get('size_mb', 0):.2f} MB"
+            )
+            self.latency_tracker.pop(seq_id, None)
+
+    def _record_latency(self, seq_id: int, stage: str, **extra):
+        """Store timestamped latency info for a seq."""
+        entry = self.latency_tracker.get(seq_id, {})
+        entry[f"{stage}_ts"] = time.time()
+        entry.update(extra)
+        self.latency_tracker[seq_id] = entry
 
 
 # ============================================================================
@@ -2309,6 +2415,15 @@ class DepthSplatServer:
             else None
         )
         self.capture_saved = 0
+        # Per-camera counters and latency tracking
+        self.cam_frame_counts = [0, 0]
+        self.last_status_counts = [0, 0]
+        self.last_status_time = time.time()
+        self.latest_frame_overwrites = 0
+        self.latency_tracker: dict[int, dict[str, float]] = {}
+        self.last_frame_wall: list[float] = [0.0, 0.0]
+        self.last_frame_ts: list[int] = [0, 0]
+        self.duplicate_ts_counts: list[int] = [0, 0]
         
         # Rate limiting
         self.last_process_time = 0.0
@@ -2360,6 +2475,7 @@ class DepthSplatServer:
                 self.config,
                 on_complete=on_output_complete,
                 save_files=self.config.save_files,
+                latency_hook=self._on_output_emitted,
             )
             self.worker_pool = GPUWorkerPool(self.config)
             self.worker_pool.start()
@@ -2375,7 +2491,7 @@ class DepthSplatServer:
             print("="*70 + "\n")
             
             # Start result listener to feed OutputSequencer
-            self.worker_pool.start_result_listener(self.output_sequencer.add_result)
+            self.worker_pool.start_result_listener(self._on_worker_result)
             
             # Start processing thread
             self.running = True
@@ -2433,6 +2549,14 @@ class DepthSplatServer:
                 frames = cam.frame_count
                 cam_states.append(f"cam{cam.camera_id}:{state}({frames}f)")
             states_str = " | ".join(cam_states)
+            now = time.time()
+            interval = max(1e-6, now - self.last_status_time)
+            fps0 = (self.cam_frame_counts[0] - self.last_status_counts[0]) / interval
+            fps1 = (self.cam_frame_counts[1] - self.last_status_counts[1]) / interval
+            self.last_status_counts = list(self.cam_frame_counts)
+            self.last_status_time = now
+            age0 = now - self.last_frame_wall[0] if self.last_frame_wall[0] > 0 else float("inf")
+            age1 = now - self.last_frame_wall[1] if self.last_frame_wall[1] > 0 else float("inf")
             
             # Show actual in-flight count (pull model ensures this stays small)
             in_flight = self.worker_pool.get_in_flight_count() if self.worker_pool else 0
@@ -2440,7 +2564,12 @@ class DepthSplatServer:
             if dropped < 0:
                 dropped = 0  # Can be negative briefly during transitions
             
-            print(f"[Status] Elapsed: {elapsed:.1f}s | InFlight: {in_flight} | Processed: {self.frame_pairs_processed} | Dropped: {dropped} | {states_str}")
+            print(
+                f"[Status] Elapsed: {elapsed:.1f}s | InFlight: {in_flight} | "
+                f"Processed: {self.frame_pairs_processed} | Dropped: {dropped} | "
+                f"FPS: [{fps0:.1f}|{fps1:.1f}] | Overwrites: {self.latest_frame_overwrites} | "
+                f"Age: [{age0:.2f}s|{age1:.2f}s] | {states_str}"
+            )
             return True  # Repeat
         GLib.timeout_add(5000, report_status)  # Report every 5 seconds
         
@@ -2489,6 +2618,16 @@ class DepthSplatServer:
         # Check if we should stop accepting new frames
         if not self.running:
             return
+        self.cam_frame_counts[camera_id] += 1
+        now = time.time()
+        if self.last_frame_ts[camera_id] == timestamp_ns:
+            self.duplicate_ts_counts[camera_id] += 1
+            if self.duplicate_ts_counts[camera_id] % 50 == 1 and self.config.verbose:
+                print(f"[Camera {camera_id}] Warning: duplicate timestamp frames seen ({self.duplicate_ts_counts[camera_id]})")
+        else:
+            self.duplicate_ts_counts[camera_id] = 0
+        self.last_frame_ts[camera_id] = timestamp_ns
+        self.last_frame_wall[camera_id] = now
             
         # Check max_frame_pairs limit
         if self.config.max_frame_pairs > 0 and self.frame_pairs_queued >= self.config.max_frame_pairs:
@@ -2529,7 +2668,16 @@ class DepthSplatServer:
                 old_frame = self.latest_frame
                 self.latest_frame = (proc_seq_id, frames_dict)
                 self.frame_pairs_queued += 1
-                
+                if old_frame is not None:
+                    self.latest_frame_overwrites += 1
+            ts0 = frames_dict[0][0]
+            ts1 = frames_dict[1][0]
+            skew_ms = abs(ts0 - ts1) / 1_000_000
+            self.latency_tracker[proc_seq_id] = {
+                "paired_at": time.time(),
+                "skew_ms": skew_ms,
+            }
+            
             
             # Signal that a new frame is available
             self.latest_frame_event.set()
@@ -2578,13 +2726,50 @@ class DepthSplatServer:
                 self._save_debug_frames(seq_id, frames_dict)
             
             # Mark as submitted for correct output ordering, then submit to specific worker
+            self._record_latency(seq_id, "submitted")
             self.output_sequencer.mark_submitted(seq_id)
             self.worker_pool.submit_to_worker(
                 worker,
                 seq_id,
                 frames_dict,
             )
-                
+    
+    def _on_worker_result(self, seq_id: int, output: bytes):
+        """Record latency and forward result to sequencer."""
+        self._record_latency(seq_id, "result")
+        self.output_sequencer.add_result(seq_id, output)
+
+    def _on_output_emitted(self, seq_id: int, stage: str, extra: dict):
+        """Latency hook from OutputSequencer."""
+        self._record_latency(seq_id, stage, **extra)
+        entry = self.latency_tracker.get(seq_id, {})
+        paired_at = entry.get("paired_at")
+        submit_ts = entry.get("submitted_ts")
+        result_ts = entry.get("result_ts")
+        emit_ts = entry.get("emit_ts", time.time())
+        skew_ms = entry.get("skew_ms", 0.0)
+        if paired_at:
+            pair_to_submit = (submit_ts - paired_at) if submit_ts else float("nan")
+            submit_to_result = (result_ts - submit_ts) if (submit_ts and result_ts) else float("nan")
+            result_to_emit = (emit_ts - result_ts) if (emit_ts and result_ts) else float("nan")
+            total = emit_ts - paired_at
+            print(
+                "[Latency] seq "
+                f"{seq_id} | skew {skew_ms:.1f}ms | "
+                f"pair→submit {pair_to_submit:.3f}s | "
+                f"submit→result {submit_to_result:.3f}s | "
+                f"result→emit {result_to_emit:.3f}s | "
+                f"total {total:.3f}s | size {extra.get('size_mb', 0):.2f} MB"
+            )
+            self.latency_tracker.pop(seq_id, None)
+
+    def _record_latency(self, seq_id: int, stage: str, **extra):
+        """Store timestamped latency info for a seq."""
+        entry = self.latency_tracker.get(seq_id, {})
+        entry[f"{stage}_ts"] = time.time()
+        entry.update(extra)
+        self.latency_tracker[seq_id] = entry
+
     def _save_debug_frames(self, seq_id: int, frames_dict: dict):
         """Save input frames for debugging."""
         debug_dir = Path(self.config.output_dir) / "debug_frames"
