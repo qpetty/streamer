@@ -3235,8 +3235,8 @@ def create_tcp_h264_config(
     return ServerConfig(
         camera_0_source=source_0,
         camera_1_source=source_1,
-        input_width=1920,
-        input_height=1080,
+        input_width=960,
+        input_height=512,
         input_framerate=30,
         frame_skip=2,
         max_fps=15.0,
