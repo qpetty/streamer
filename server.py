@@ -145,7 +145,7 @@ from collections import OrderedDict
 import io
 from PIL import Image
 
-os.environ["HF_HOME"] = "/root/.cache"
+#os.environ["HF_HOME"] = "/root/.cache"
 
 # ============================================================================
 # Import DepthSplat inference from ../depthsplat
@@ -3309,14 +3309,15 @@ def create_srt_config(url_0: str, url_1: str) -> ServerConfig:
         url_1: SRT URL for camera 1 (e.g., srt://:8081?mode=listener)
     """
     return ServerConfig(
-        camera_0_source=f'srtsrc uri="{url_0}" ! decodebin ! videoconvert',
-        camera_1_source=f'srtsrc uri="{url_1}" ! decodebin ! videoconvert',
+        camera_0_source=f'srtsrc uri="{url_0}" do-timestamp=true ! decodebin ! videoconvert',
+        camera_1_source=f'srtsrc uri="{url_1}" do-timestamp=true ! decodebin ! videoconvert',
         input_width=1920,
         input_height=1080,
         input_framerate=30,
         frame_skip=2,
         max_fps=15.0,
-        use_frame_count_sync=True,  # Use frame count sync since SRT devices have different clocks
+        # Use timestamp-based sync so cameras can connect at different times
+        use_frame_count_sync=False,
         verbose=True,
     )
 
