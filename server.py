@@ -232,7 +232,7 @@ class ServerConfig:
     max_fps: float = 0.0
     
     # Maximum queue size for pending frame pairs (older frames dropped when full)
-    max_queue_size: int = 10
+    max_queue_size: int = 20
     
     # --- Duration/Limit Settings ---
     # Duration in seconds to run (0 = run indefinitely until Ctrl+C)
@@ -302,6 +302,13 @@ class ServerConfig:
     
     # STUN server for ICE (empty = use Google's public server)
     stun_server: str = "stun://stun.l.google.com:19302"
+    
+    # --- Deduplication Settings ---
+    # Drop frame pairs whose mean absolute pixel diff vs. previous pair is below this threshold
+    dedup_enabled: bool = False
+    dedup_mad_threshold: float = 2.0
+    # Optional minimum interval (seconds) between processed pairs; duplicates inside this window are dropped
+    dedup_min_interval: float = 0.0
     
     # --- SSL/TLS Settings ---
     # Path to SSL certificate file (enables HTTPS/WSS when set)
@@ -970,6 +977,63 @@ class OutputSequencer:
 # ============================================================================
 # Frame Capture Writer
 # ============================================================================
+
+class FrameDeduplicator:
+    """
+    Lightweight deduplicator to skip nearly identical frame pairs.
+    
+    Uses mean absolute pixel difference per camera and an optional minimum
+    interval gate to avoid redundant inferences on highly similar inputs.
+    """
+    
+    def __init__(self, enabled: bool, threshold: float, min_interval: float = 0.0):
+        self.enabled = enabled
+        self.threshold = threshold
+        self.min_interval = min_interval
+        self.last_frames: Optional[dict[int, np.ndarray]] = None
+        self.last_time: float = 0.0
+        self.skipped: int = 0
+        self.lock = threading.Lock()
+    
+    def is_duplicate(self, frames_dict: dict) -> bool:
+        if not self.enabled:
+            return False
+        
+        now = time.time()
+        
+        with self.lock:
+            # Optional time-based gate
+            if self.min_interval > 0 and (now - self.last_time) < self.min_interval:
+                self.skipped += 1
+                return True
+            
+            # If no reference yet, store and allow
+            if self.last_frames is None:
+                self.last_frames = {cam_id: frame for cam_id, (_, frame) in frames_dict.items()}
+                self.last_time = now
+                return False
+            
+            diffs = []
+            for cam_id, (_, frame) in frames_dict.items():
+                prev = self.last_frames.get(cam_id)
+                if prev is None or prev.shape != frame.shape:
+                    # Mismatch in shape or missing cam -> treat as new
+                    diffs.append(self.threshold + 1.0)
+                    continue
+                # Use int16 to avoid uint8 overflow on subtraction
+                diff = np.mean(np.abs(frame.astype(np.int16) - prev.astype(np.int16)))
+                diffs.append(diff)
+            
+            is_dup = bool(diffs) and all(d < self.threshold for d in diffs)
+            
+            if is_dup:
+                self.skipped += 1
+                return True
+            
+            # Update reference on non-duplicate
+            self.last_frames = {cam_id: frame for cam_id, (_, frame) in frames_dict.items()}
+            self.last_time = now
+            return False
 
 
 class FrameCaptureWriter:
@@ -1998,6 +2062,11 @@ class WebRTCDepthSplatServer:
             num_cameras=2,
             use_frame_count_sync=True  # WebRTC streams use frame count sync
         )
+        self.deduplicator = FrameDeduplicator(
+            enabled=self.config.dedup_enabled,
+            threshold=self.config.dedup_mad_threshold,
+            min_interval=self.config.dedup_min_interval,
+        )
         self.worker_pool: Optional[GPUWorkerPool] = None
         self.output_sequencer: Optional[OutputSequencer] = None
         self.cameras: Dict[int, WebRTCCameraPipeline] = {}
@@ -2260,6 +2329,12 @@ class WebRTCDepthSplatServer:
         if result is not None:
             sync_seq_id, frames_dict = result
             
+            # Deduplicate against previous pair
+            if self.deduplicator.is_duplicate(frames_dict):
+                if self.config.verbose and (self.deduplicator.skipped % 50 == 1):
+                    print(f"[Dedup] Skipping nearly-identical pair (total skipped {self.deduplicator.skipped})")
+                return
+            
             # Rate limiting
             if self.min_frame_interval > 0:
                 current_time = time.time()
@@ -2403,6 +2478,11 @@ class DepthSplatServer:
         self.synchronizer = FrameSynchronizer(
             num_cameras=2,
             use_frame_count_sync=self.config.use_frame_count_sync
+        )
+        self.deduplicator = FrameDeduplicator(
+            enabled=self.config.dedup_enabled,
+            threshold=self.config.dedup_mad_threshold,
+            min_interval=self.config.dedup_min_interval,
         )
         self.worker_pool: Optional[GPUWorkerPool] = None
         self.output_sequencer: Optional[OutputSequencer] = None
@@ -2638,6 +2718,12 @@ class DepthSplatServer:
         
         if result is not None:
             sync_seq_id, frames_dict = result
+            
+            # Deduplicate nearly-identical pairs before enqueueing
+            if self.deduplicator.is_duplicate(frames_dict):
+                if self.config.verbose and (self.deduplicator.skipped % 50 == 1):
+                    print(f"[Dedup] Skipping nearly-identical pair (total skipped {self.deduplicator.skipped})")
+                return
             
             # Apply rate limiting
             if self.min_frame_interval > 0:
